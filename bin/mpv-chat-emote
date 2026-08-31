@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Download + decode chat emotes into a permanent BGRA cache for mpv overlays.
+
+    mpv-chat-emote <url> [<url> ...]
+
+For each URL, writes into ~/.cache/mpv-chat-emotes/:
+    <key>.bgra   raw BGRA frames, concatenated, ready for mpv's overlay-add
+    <key>.json   {"w", "h", "n": <frames>, "fps": <float>, "v": 2}
+
+Animated emotes keep every frame in the ONE file: mpv's overlay-add takes a
+byte offset into the file, so playing frame i is just re-issuing the command
+with offset i*w*h*4 -- no extra files, no re-reads.
+
+`key` is computed identically here and in chat_overlay.lua (djb2, no bit ops,
+so it is exact in Lua's doubles) -- the Lua side must be able to test the cache
+synchronously while rendering, without shelling out.
+
+Best effort by design: any failure is silent and simply leaves the emote
+rendering as text. Never blocks chat.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "mpv-chat-emotes")
+TIMEOUT = 30
+MAX_BYTES = 4 * 1024 * 1024
+CACHE_VERSION = 2          # bump to force a re-decode of every cached emote
+MAX_FPS = 25               # emotes are decoded at native fps up to this
+MAX_FRAMES = 120           # ~5 s at 25 fps; longer loops are truncated
+MAX_H = 64                 # taller sources are scaled down; nothing draws bigger
+MAX_RAW = 3 * 1024 * 1024  # hard ceiling: overlay-add mmaps the WHOLE file
+                           # on every frame update, so keep them small
+UA = "mpv-chat-overlay/1.0"
+_SAFE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def cache_key(url):
+    """djb2 over the raw URL, prefixed by a readable sanitised form.
+
+    Must stay byte-for-byte identical to key_for() in chat_overlay.lua.
+    """
+    h = 5381
+    for b in url.encode("utf-8"):
+        h = (h * 33 + b) % 4294967296
+    return "%s_%08x" % (_SAFE.sub("_", url)[-120:], h)
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        return r.read(MAX_BYTES)
+
+
+def probe(path):
+    """(width, height, fps, frames).
+
+    Frames are COUNTED (-count_frames): animated webp reports neither
+    nb_frames nor duration (both N/A), so there is no cheap way to learn the
+    loop length. It is a second decode pass, but these files are a few KB and
+    it happens once per emote, ever.
+    """
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=width,height,avg_frame_rate,nb_read_frames",
+         "-of", "json", path],
+        capture_output=True, text=True, timeout=TIMEOUT)
+    st = json.loads(out.stdout)["streams"][0]
+    num, _, den = (st.get("avg_frame_rate") or "0/1").partition("/")
+    try:
+        fps = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    try:
+        frames = int(st.get("nb_read_frames") or 1)
+    except ValueError:
+        frames = 1
+    return int(st["width"]), int(st["height"]), fps, max(1, frames)
+
+
+def decode(src, dst, fps, w, h, frames, src_w, src_h):
+    """Decode `frames` frames, concatenated, as raw BGRA.
+
+    Width and height are passed EXPLICITLY rather than using scale=-2: our own
+    frame-size arithmetic has to agree with ffmpeg's to the byte, or the size
+    check below rejects the emote and it silently never renders.
+    """
+    # premultiply BEFORE any scaling: mpv's overlay-add demands premultiplied
+    # alpha ("every color component is already multiplied with the alpha
+    # component"), and plain -pix_fmt bgra gives STRAIGHT alpha. Measured on
+    # the old v1 cache: 22 of 40 emotes violated it, with fully transparent
+    # pixels carrying full-intensity colour -- that is the halo/fringe around
+    # a soft emote edge.
+    #
+    # `area`, not lanczos: a ringing kernel overshoots and pushes a channel
+    # back above alpha (measured: 8 violating components on a no-op rescale),
+    # which re-breaks the invariant premultiply just established. Scaling only
+    # happens for sources taller than MAX_H, which is rare.
+    vf = ["format=rgba", "premultiply=inplace=1"]
+    if (w, h) != (src_w, src_h):
+        vf.append("scale=%d:%d:flags=area" % (w, h))
+    if fps:
+        vf.insert(0, "fps=%g" % fps)
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", src, "-vf", ",".join(vf),
+         "-frames:v", str(frames), "-f", "rawvideo", "-pix_fmt", "bgra", dst],
+        check=True, timeout=TIMEOUT)
+
+
+def cached_version(meta_path):
+    try:
+        with open(meta_path) as f:
+            return json.load(f).get("v")
+    except Exception:
+        return None
+
+
+def one(url):
+    key = cache_key(url)
+    bgra = os.path.join(CACHE, key + ".bgra")
+    meta = os.path.join(CACHE, key + ".json")
+    # A v1 entry holds only the first frame, so it has to be re-decoded to
+    # animate. Re-publishing is safe even while mpv is compositing the old
+    # file: os.replace swaps the directory entry and mpv keeps its own mapping
+    # of the previous inode alive.
+    if (os.path.exists(bgra) and os.path.exists(meta)
+            and cached_version(meta) == CACHE_VERSION):
+        return
+    data = fetch(url)
+    tmpd = tempfile.mkdtemp(dir=CACHE)
+    try:
+        raw = os.path.join(tmpd, "in")
+        with open(raw, "wb") as f:
+            f.write(data)
+        sw, sh, sfps, sframes = probe(raw)
+        h = min(sh, MAX_H)
+        w = sw if h == sh else max(1, round(sw * h / sh))
+        frame = w * h * 4
+
+        fps, want = min(sfps, MAX_FPS) if sfps > 0 else 0.0, sframes
+        if sfps > MAX_FPS:                      # resample down to MAX_FPS
+            want = max(1, round(sframes * MAX_FPS / sfps))
+        cap = min(MAX_FRAMES, max(1, MAX_RAW // frame))
+        if want > cap:
+            # Subsample the WHOLE loop instead of truncating it: a cut loop
+            # visibly jumps at the wrap, a slower one just looks choppier.
+            fps = fps * cap / want
+            want = cap
+        if want <= 1:
+            fps = 0.0
+
+        out = os.path.join(tmpd, "out.bgra")
+        decode(raw, out, fps, w, h, want, sw, sh)
+        size = os.path.getsize(out)
+        # Frame count comes from the bytes actually written, never from
+        # ffprobe: a mismatch here means our arithmetic and ffmpeg's disagree,
+        # and a wrong stride would render garbage.
+        if size < frame or size % frame:
+            return
+        n = size // frame
+        if n == 1:
+            fps = 0.0
+        # Publish atomically. mpv reads the .bgra directly while compositing,
+        # and thumbfast's source warns that overwriting a file mid-read can
+        # crash the player -- so rename in, never write in place.
+        with open(os.path.join(tmpd, "m.json"), "w") as f:
+            json.dump({"w": w, "h": h, "n": n, "fps": round(fps, 3),
+                       "v": CACHE_VERSION}, f)
+        os.replace(out, bgra)
+        os.replace(os.path.join(tmpd, "m.json"), meta)
+    finally:
+        for leftover in os.listdir(tmpd):
+            try:
+                os.remove(os.path.join(tmpd, leftover))
+            except OSError:
+                pass
+        os.rmdir(tmpd)
+
+
+def main():
+    os.makedirs(CACHE, exist_ok=True)
+    for url in sys.argv[1:]:
+        try:
+            one(url)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

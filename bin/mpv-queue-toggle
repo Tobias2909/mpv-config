@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Toggle mpv queue mode from outside mpv (bind to a KDE global shortcut, so it
+# works while the browser is focused and mpv is fullscreen on the TV).
+#
+# Preferred path: hand the toggle to queue_mode.lua inside the running mpv via
+# IPC, so there is exactly one implementation of the state change (flag file +
+# loop-playlist + OSD). Fallback (no live mpv): flip the flag file here, so the
+# next browser handoff starts a fresh mpv already in queue mode.
+
+set -u
+
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/mpv-ff2mpv.sock"
+FLAG="${XDG_RUNTIME_DIR:-/tmp}/mpv-ff2mpv.queue"
+
+alive() {
+    [[ -S "$SOCK" ]] || return 1
+    local reply
+    reply="$(printf '%s\n' '{"command":["get_property","mpv-version"]}' \
+        | socat -t 0.5 - "UNIX-CONNECT:$SOCK" 2>/dev/null)" || return 1
+    [[ -n "$reply" ]] && jq -e '.error == "success"' <<<"$reply" >/dev/null 2>&1
+}
+
+if alive; then
+    printf '%s\n' '{"command":["script-message","queue-mode-toggle"]}' \
+        | socat -t 0.5 - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1
+    exit 0
+fi
+
+# No live instance — own the state change here, and say so via notification
+# since there is no OSD to write to.
+if [[ -e "$FLAG" ]]; then
+    rm -f "$FLAG"
+    MSG="Queue mode OFF (no mpv running)"
+else
+    : >"$FLAG"
+    MSG="Queue mode ON (no mpv running — next video starts a looping queue)"
+fi
+command -v notify-send >/dev/null 2>&1 && notify-send -a mpv -t 3000 "mpv" "$MSG"
+exit 0

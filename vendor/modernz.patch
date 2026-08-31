@@ -1,0 +1,17 @@
+--- a/modernz.lua
++++ b/modernz.lua
+@@ -2539,11 +2539,9 @@
+         end
+     end
+ 
+-    elements["play_pause"].visible = osc_param.playresx >= 200
+-    lo = add_layout("play_pause")
+-    lo.geometry = {x = start_x, y = refY - (user_opts.osc_height / 2), an = 5, w = 24, h = 24}
+-    lo.style = osc_styles.control_2
+-    start_x = start_x + 45
++    -- local patch: play/pause button removed from the compact layout
++    -- (pause is on right-click); other layouts keep theirs
++    elements["play_pause"].visible = false
+ 
+     local pl_count = state.playlist_count
+     local pl_pos = state.playlist_pos_1

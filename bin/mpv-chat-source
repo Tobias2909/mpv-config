@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""Normalise Twitch / YouTube chat into one JSONL stream for chat_overlay.lua.
+
+Usage:
+    mpv-chat-source --out FILE twitch  <channel>
+    mpv-chat-source --out FILE youtube <url>
+
+One JSON object per line, flushed immediately:
+
+    {"t": null|float, "user": "...", "color": "#RRGGBB"|null,
+     "text": "...", "e": <platform emote payload or null>}
+
+`t` is the video offset in seconds for VOD replay chat, null for live chat --
+that is what tells the Lua side whether to sync to time-pos or just append.
+`e` is a list of {"label", "url"} emotes (Twitch native + 7TV/BTTV/FFZ,
+and YouTube custom emoji) that chat_overlay.lua composites over the text.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import zlib
+
+MAX_TEXT = 400
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+# Fallback name colours, chosen to stay readable on the dark chat backdrop.
+# YouTube sends no colour at all and Twitch omits it for users who never picked
+# one, so both get a stable pseudo-random colour instead of flat grey.
+PALETTE = (
+    "#FF4C4C", "#FF7F50", "#FFA500", "#DAA520",
+    "#9ACD32", "#3CB371", "#2ECC71", "#00CED1",
+    "#1E90FF", "#5F9EA0", "#7B9BFF", "#B18CFF",
+    "#FF69B4", "#FF8AC7", "#D2691E", "#20B2AA",
+)
+
+
+def colour_for(name):
+    """Same name -> same colour, always.
+
+    Uses crc32, NOT hash(): Python randomises str hashing per process via
+    PYTHONHASHSEED, so hash() would repaint everyone whenever the helper
+    restarts (every stream switch).
+    """
+    return PALETTE[zlib.crc32(name.lower().encode("utf-8")) % len(PALETTE)]
+
+_stop = False
+
+
+def _sigterm(*_a):
+    global _stop
+    _stop = True
+
+
+class Sink:
+    """Line-buffered JSONL writer."""
+
+    def __init__(self, path):
+        self.f = open(path, "a", encoding="utf-8", buffering=1)
+
+    def emit(self, user, text, color=None, t=None, e=None, w=None):
+        text = _CTRL.sub("", text).strip()
+        if not text:
+            return
+        # `w` = the wall clock the message belongs to, which chat_overlay.lua
+        # maps onto a playback position (so chat freezes while the video is
+        # paused and resumes exactly as far behind live as the video is).
+        # Default is arrival time, correct for Twitch IRC where arrival is
+        # realtime. YouTube passes the message's OWN post time instead -- see
+        # run_youtube: its chat arrives in ~10 s fragments, so arrival time is
+        # identical for every message in a fragment and they would all become
+        # due at the same instant.
+        # YouTube reports authorName as a handle ("@someone"); strip the @.
+        user = _CTRL.sub("", user).lstrip("@")[:40] or "?"
+        # `a` = arrival (a real local wall clock reading), always. The Lua side
+        # needs it to pin wall clock to playback position: `w` may be a YouTube
+        # POST time, which can be minutes older than "now" and is useless as a
+        # clock reference. a - w is also the pipeline lag, which is what the
+        # adaptive smoothing delay is derived from.
+        now = time.time()
+        rec = {"t": t, "w": w if w is not None else now, "a": now, "user": user,
+               "color": color or colour_for(user),
+               "text": text[:MAX_TEXT], "e": e}
+        self.f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# --------------------------------------------------------------------- twitch
+
+IRC_HOST, IRC_PORT = "irc.chat.twitch.tv", 6697
+TAG_RE = re.compile(r"^@([^ ]*) :([^!]+)![^ ]* PRIVMSG #[^ ]+ :(.*)$")
+
+
+def parse_tags(blob):
+    out = {}
+    for pair in blob.split(";"):
+        k, _, v = pair.partition("=")
+        out[k] = v
+    return out
+
+
+def handle_privmsg(line, sink):
+    """One tagged PRIVMSG -> one record. Module level so it is unit-testable."""
+    m = TAG_RE.match(line)
+    if not m:
+        return
+    tags = parse_tags(m.group(1))
+    user = tags.get("display-name") or m.group(2)
+    color = tags.get("color") or None
+    raw = m.group(3)
+    act = ACTION_RE.match(raw)
+    clean = _CTRL.sub("", act.group(1) if act else raw).strip()
+    srcs = (raw, act.group(1)) if act else (raw,)
+    emotes = native_emotes(tags.get("emotes") or "", srcs, clean)
+    taken = {e["label"] for e in emotes}
+    emotes += third_party_emotes(clean, taken)
+    sink.emit(user, clean, color=color, e=emotes or None)
+
+
+def run_twitch(channel, sink):
+    backoff = 1
+    room_id = None
+    while not _stop:
+        try:
+            ctx = ssl.create_default_context()
+            raw = socket.create_connection((IRC_HOST, IRC_PORT), timeout=20)
+            sock = ctx.wrap_socket(raw, server_hostname=IRC_HOST)
+            sock.settimeout(1.0)
+            nick = "justinfan%d" % random.randint(10000, 99999)
+            sock.sendall(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
+            sock.sendall(("PASS SCHMOOPIIE\r\nNICK %s\r\n" % nick).encode())
+            sock.sendall(("JOIN #%s\r\n" % channel).encode())
+            backoff = 1
+            buf = b""
+            while not _stop:
+                try:
+                    data = sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                buf += data
+                while b"\r\n" in buf:
+                    line, buf = buf.split(b"\r\n", 1)
+                    text = line.decode("utf-8", "replace")
+                    if text.startswith("PING"):
+                        sock.sendall(b"PONG :tmi.twitch.tv\r\n")
+                        continue
+                    if text.startswith("@") and " ROOMSTATE " in text:
+                        # The channel's numeric id, needed for the 7TV/BTTV/FFZ
+                        # lookups, arrives free in this tag right after JOIN.
+                        rid = parse_tags(text[1:].split(" ", 1)[0]).get("room-id")
+                        if rid and rid != room_id:
+                            room_id = rid
+                            threading.Thread(target=load_third_party,
+                                             args=(rid,), daemon=True).start()
+                        continue
+                    handle_privmsg(text, sink)
+            try:
+                sock.close()
+            except OSError:
+                pass
+        except Exception:
+            pass
+        if _stop:
+            return
+        time.sleep(min(backoff, 30))
+        backoff *= 2
+
+
+# ------------------------------------------------------ twitch emotes (2b)
+#
+# Native emotes come from the IRC `emotes=` tag. 7TV / BTTV / FFZ emotes are
+# plain words with nothing marking them, so they need a per-channel
+# name -> URL dictionary; the channel's numeric id comes free from the
+# ROOMSTATE tag `room-id` (no Twitch API key, no OAuth).
+#
+# Everything is emitted in the SAME {label, url} shape YouTube already uses,
+# so chat_overlay.lua needs no changes.
+
+CDN_TWITCH = "https://static-cdn.jtvnw.net/emoticons/v2/%s/default/dark/2.0"
+HTTP_TIMEOUT = 8
+ACTION_RE = re.compile("^\x01ACTION (.*)\x01$")
+_WORD = re.compile(r"\S+")
+
+_tp_cache = {}      # room-id -> {name: url}, so a reconnect refetches nothing
+_third_party = {}   # live map for the current channel (swapped in atomically)
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "mpv-chat-overlay/1.0"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
+
+
+def _seventv(out, url):
+    d = _get_json(url)
+    emotes = d.get("emotes")
+    if emotes is None:                      # /users/twitch/<id> nests it
+        emotes = (d.get("emote_set") or {}).get("emotes") or []
+    for e in emotes:
+        name, eid = e.get("name"), e.get("id")
+        if name and eid:
+            out[name] = "https://cdn.7tv.app/emote/%s/2x.webp" % eid
+
+
+def _bttv_items(out, items):
+    for e in items or []:
+        name, eid = e.get("code"), e.get("id")
+        if name and eid:
+            out[name] = "https://cdn.betterttv.net/emote/%s/2x" % eid
+
+
+def _bttv_channel(out, room_id):
+    d = _get_json("https://api.betterttv.net/3/cached/users/twitch/%s" % room_id)
+    # Both lists can be empty for a channel with no BTTV emotes -- not an error.
+    _bttv_items(out, d.get("channelEmotes"))
+    _bttv_items(out, d.get("sharedEmotes"))
+
+
+def _ffz(out, url):
+    d = _get_json(url)
+    for s in (d.get("sets") or {}).values():
+        for e in s.get("emoticons") or []:
+            name = e.get("name")
+            urls = e.get("urls") or {}
+            u = urls.get("2") or urls.get("1")
+            if name and u:
+                out[name] = ("https:" + u) if u.startswith("//") else u
+
+
+def load_third_party(room_id):
+    """Build the 7TV + BTTV + FFZ name -> URL map for one channel.
+
+    Runs in a thread -- chat must never wait on HTTP. Globals are fetched
+    first so channel emotes override them on a name clash. Each source is
+    independent: one failing (or BTTV returning empty lists) costs only that
+    source. Messages that arrive before the map lands simply render as text.
+    """
+    global _third_party
+    cached = _tp_cache.get(room_id)
+    if cached is not None:
+        _third_party = cached
+        return
+    out = {}
+    steps = (
+        lambda: _seventv(out, "https://7tv.io/v3/emote-sets/global"),
+        lambda: _bttv_items(out, _get_json("https://api.betterttv.net/3/cached/emotes/global")),
+        lambda: _ffz(out, "https://api.frankerfacez.com/v1/set/global"),
+        lambda: _seventv(out, "https://7tv.io/v3/users/twitch/%s" % room_id),
+        lambda: _bttv_channel(out, room_id),
+        lambda: _ffz(out, "https://api.frankerfacez.com/v1/room/id/%s" % room_id),
+    )
+    for step in steps:
+        try:
+            step()
+        except Exception:
+            pass
+    _tp_cache[room_id] = out
+    _third_party = out
+
+
+def native_emotes(tag, sources, text):
+    """Parse `emotes=<id>:<a>-<b>,<c>-<d>/<id2>:...`.
+
+    The ranges are CODEPOINT offsets, not byte offsets -- Python str slicing is
+    codepoints, so they index the PRIVMSG body directly. Only the first range
+    per id is needed: the label is the same for all of them, and the Lua side
+    finds every occurrence itself.
+
+    `sources` is every string the offsets might be counted against, tried in
+    order: the raw body, and for a /me the text inside the ACTION wrapper
+    (Twitch is not consistent about whether the wrapper counts). A slice is
+    only accepted when it actually occurs in the cleaned text, so a wrong
+    offset degrades to plain text instead of painting an image over an
+    unrelated word.
+    """
+    out = []
+    for part in tag.split("/"):
+        eid, _, ranges = part.partition(":")
+        first = ranges.split(",")[0]
+        a, _, b = first.partition("-")
+        try:
+            i, j = int(a), int(b) + 1
+        except ValueError:
+            continue
+        for src in sources:
+            label = src[i:j]
+            if label and label in text:
+                out.append({"label": label, "url": CDN_TWITCH % eid})
+                break
+    return out
+
+
+def _whole_word_only(text, word):
+    """True if every occurrence of `word` in `text` is whitespace-delimited.
+
+    chat_overlay.lua matches labels with a plain substring find, so an emote
+    named e.g. "D" would paint an image over the D of an unrelated word.
+    """
+    pos = 0
+    while True:
+        i = text.find(word, pos)
+        if i < 0:
+            return True
+        j = i + len(word)
+        if (i > 0 and not text[i - 1].isspace()) or \
+           (j < len(text) and not text[j].isspace()):
+            return False
+        pos = j
+
+
+def third_party_emotes(text, taken):
+    m = _third_party
+    if not m:
+        return []
+    out = []
+    for word in dict.fromkeys(_WORD.findall(text)):
+        if len(word) < 2 or word in taken:
+            continue
+        url = m.get(word)
+        if url and _whole_word_only(text, word):
+            taken.add(word)
+            out.append({"label": word, "url": url})
+    return out
+
+
+# -------------------------------------------------------------------- youtube
+
+def yt_runs_to_text(runs):
+    parts = []
+    emojis = []
+    for r in runs:
+        if "text" in r:
+            parts.append(r["text"])
+        elif "emoji" in r:
+            emo = r["emoji"]
+            label = ""
+            sc = emo.get("shortcuts") or []
+            if sc:
+                label = sc[0]
+            elif emo.get("emojiId"):
+                label = emo["emojiId"]
+            parts.append(label)
+            # STANDARD unicode emoji get an image too, not just channel
+            # emoji. Both shapes carry image.thumbnails; the only difference
+            # is that a standard one has no isCustomEmoji and its emojiId is
+            # the character itself while a custom one's is a channel path:
+            #   {"emojiId": "\U0001f49a", "shortcuts": [":green_heart:"],
+            #    "image": {"thumbnails": [{"url": ".../notoemoji/.../72.png"}]}}
+            # Gating on isCustomEmoji left every unicode emoji rendering as
+            # the literal ":green_heart:". Measured on one VOD's replay chat:
+            # 10112 standard emoji runs vs 520 custom, i.e. 95% of all emoji
+            # were text. The label stays the SHORTCUT, not the character:
+            # it is what the text fallback shows when an image is missing or
+            # F11-disabled, and it is ASCII, so it neither turns into a tofu
+            # box in Noto Sans Mono CJK JP nor breaks the monospace column
+            # arithmetic.
+            thumbs = emo.get("image", {}).get("thumbnails") or []
+            if thumbs:
+                emojis.append({"label": label, "url": thumbs[-1]["url"]})
+    return "".join(parts), (emojis or None)
+
+
+def yt_handle_record(rec, sink):
+    action = rec.get("replayChatItemAction")
+    if not action:
+        return
+    # Live records carry isLive plus an offset measured from the moment yt-dlp
+    # joined the stream (it starts negative for the backlog), so the offset is
+    # only meaningful on a VOD. Verified against a live stream: 126/126 records
+    # had an offset, ranging -102.7 -> +58.5 s.
+    if rec.get("isLive"):
+        t = None
+    else:
+        # The two schemas differ and this is easy to get wrong: a LIVE record
+        # carries videoOffsetTimeMsec at the TOP level (and it is useless --
+        # measured from when yt-dlp joined, goes negative), while a VOD REPLAY
+        # record carries it INSIDE replayChatItemAction, as a true video
+        # offset. Reading only the top level made every replay message t=None,
+        # which made the overlay treat a VOD as live chat.
+        offset = rec.get("videoOffsetTimeMsec")
+        if offset is None:
+            offset = action.get("videoOffsetTimeMsec")
+        t = (float(offset) / 1000.0) if offset is not None else None
+    for act in action.get("actions") or []:
+        item = act.get("addChatItemAction", {}).get("item", {})
+        r = item.get("liveChatTextMessageRenderer")
+        if not r:
+            continue
+        author = (r.get("authorName") or {}).get("simpleText") or "?"
+        text, emojis = yt_runs_to_text((r.get("message") or {}).get("runs") or [])
+        # Every renderer carries timestampUsec (absolute epoch microseconds).
+        # Measured on a live stream: 83 of 93 records had it, 83
+        # DISTINCT values spanning 317 s, while arrival time had only 7
+        # distinct values for 84 messages. Only meaningful for live; a VOD is
+        # scheduled by `t` and ignores `w` entirely.
+        w = None
+        if t is None:
+            try:
+                w = int(r["timestampUsec"]) / 1e6
+            except (KeyError, TypeError, ValueError):
+                w = None
+        sink.emit(author, text, t=t, e=emojis, w=w)
+
+
+def run_youtube(url, sink):
+    tmpdir = tempfile.mkdtemp(prefix="mpv-chat-")
+    base = os.path.join(tmpdir, "c")
+    cmd = ["yt-dlp", "--no-warnings", "--skip-download",
+           "--write-subs", "--sub-langs", "live_chat", "-o", base, url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    part, done = base + ".live_chat.json.part", base + ".live_chat.json"
+    fh = None
+    pending = ""
+    try:
+        while not _stop:
+            if fh is None:
+                src = part if os.path.exists(part) else (
+                    done if os.path.exists(done) else None)
+                if src is None:
+                    if proc.poll() is not None:
+                        return
+                    time.sleep(0.4)
+                    continue
+                fh = open(src, "r", encoding="utf-8", errors="replace")
+            chunk = fh.read()
+            if chunk:
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yt_handle_record(json.loads(line), sink)
+                    except Exception:
+                        pass
+                continue
+            # No new data. yt-dlp renames .part -> .json when a VOD's chat is
+            # complete, but the rename does NOT invalidate our handle: it is
+            # the same inode, so we just keep reading. Reopening and seeking to
+            # a remembered offset (the previous approach) re-read the file from
+            # a stale position over and over -- 1823 real messages came out as
+            # 2.5 million duplicates.
+            if proc.poll() is not None:
+                if not fh.read():
+                    return
+                continue
+            time.sleep(0.3)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def main():
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("platform", choices=["twitch", "youtube"])
+    ap.add_argument("target")
+    args = ap.parse_args()
+    sink = Sink(args.out)
+    if args.platform == "twitch":
+        run_twitch(args.target.lower(), sink)
+    else:
+        run_youtube(args.target, sink)
+
+
+if __name__ == "__main__":
+    main()

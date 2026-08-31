@@ -1,0 +1,21 @@
+# Downloads. Fetch these yourself, see the README.
+mpv/shaders/*.glsl
+mpv/fonts/*.ttf
+mpv/fonts/*.ttc
+mpv/scripts/modernz.lua
+
+# The symlink into a browser profile, created per machine.
+mpv/browser-profile
+
+# Editor and desktop noise.
+*~
+*.swp
+*.bak
+.DS_Store
+
+# Byte code from running the python helpers in place.
+__pycache__/
+*.pyc
+
+# ModernZ ships its own translations, fetch them with the script.
+mpv/script-opts/modernz-locale.json
