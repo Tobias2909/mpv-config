@@ -2,9 +2,10 @@
 
 My everyday video player. It is one mpv process that plays local files, YouTube and Twitch,
 upscales everything with a neural network shader on the GPU, remembers the volume of every
-video I have ever watched, and paints live chat next to the picture while a stream plays. A
-click on "Play in mpv" in the browser sends the page's video straight to it, and if no player
-is running yet that click starts one.
+video I have ever watched, paints live chat next to the picture while a stream plays, and turns
+Japanese speech into English subtitles on the fly, recognised and translated on the GPU without
+anything leaving the machine. A click on "Play in mpv" in the browser sends the page's video
+straight to it, and if no player is running yet that click starts one.
 
 ![Player with the OSC visible](docs/screenshots/player.jpg)
 
@@ -18,7 +19,7 @@ for YouTube Premium enhanced bitrate, which does nothing without a Premium accou
 videos never resume where I left them because my short videos are music videos. Take the
 scripts, ignore the tuning, and throw away whatever does not suit you.
 
-The seven Lua scripts and the four helper programs are the interesting part and none of them
+The eight Lua scripts and the six helper programs are the interesting part and none of them
 exist anywhere else. Everything they need is written down below.
 
 ## What is here and what you have to fetch yourself
