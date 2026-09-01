@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# One-time install for the Japanese subtitle feature.
+#
+# Everything lives OUTSIDE this repo, under ~/.local/share/mpv-translate, so a
+# clone stays small and nothing here is ever committed. Re-running is safe.
+#
+# No torch. Every model used runs on the CTranslate2 runtime that
+# faster-whisper already pulls in, and all of them are published pre-converted,
+# so the heavy framework is never needed.
+#
+# The two nvidia wheels are NOT optional on a system without a CUDA runtime
+# installed. Without them CTranslate2 fails at the first GPU call with
+# "Library libcublas.so.12 is not found or cannot be loaded".
+set -euo pipefail
+
+ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/mpv-translate"
+VENV="$ROOT/venv"
+
+echo "==> installing into $ROOT"
+mkdir -p "$ROOT"
+
+if [ ! -x "$VENV/bin/python3" ]; then
+    echo "==> creating venv"
+    python3 -m venv "$VENV"
+fi
+
+echo "==> installing python packages"
+"$VENV/bin/pip" install --upgrade --quiet pip
+"$VENV/bin/pip" install --quiet \
+    faster-whisper \
+    sentencepiece \
+    nvidia-cublas-cu12 \
+    nvidia-cudnn-cu12
+
+echo "==> checking gpu visibility"
+"$VENV/bin/python3" - <<'PY'
+import os, sys, glob
+base = os.path.join(sys.prefix, "lib")
+libs = []
+for pkg in ("cublas", "cudnn"):
+    libs += glob.glob(os.path.join(base, "*", "site-packages", "nvidia", pkg, "lib"))
+os.environ["LD_LIBRARY_PATH"] = ":".join(libs + [os.environ.get("LD_LIBRARY_PATH", "")])
+import ctranslate2
+n = ctranslate2.get_cuda_device_count()
+print("    ctranslate2 %s, cuda devices: %d" % (ctranslate2.__version__, n))
+if n == 0:
+    print("    no cuda device visible; the feature will fall back to cpu and be slow")
+PY
+
+echo "==> fetching models (this is the long part, several gb)"
+"$VENV/bin/python3" - <<'PY'
+from huggingface_hub import snapshot_download
+from faster_whisper import WhisperModel
+import os
+print("    speech recognition model")
+WhisperModel("large-v3", device="cpu", compute_type="int8")
+print("    translation model")
+p = snapshot_download("entai2965/sugoi-v4-ja-en-ctranslate2")
+print("    ->", p)
+PY
+
+echo
+echo "==> done. press the translate key on a japanese youtube video to use it."

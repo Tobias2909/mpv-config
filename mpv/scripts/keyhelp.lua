@@ -31,6 +31,7 @@ local DESC = {
     F9 = "Queue mode: append + loop playlist",
     F10 = "Chat: off -> beside -> over (streams only)",
     F11 = "Chat emote animation on/off",
+    F12 = "Japanese to English subtitles (YouTube)",
     UP = "Volume +5",
     DOWN = "Volume -5",
     ["+"] = "Speed +10%   (also KP_ADD)",
@@ -67,7 +68,90 @@ local function pixel_rate_note()
 end
 
 -- Live state appended to a row, so the sheet says what is actually active.
+-- Progress of the subtitle generator, published by translate_subs.lua. Reading
+-- a user-data property keeps this file independent of that script: if it is not
+-- loaded the property is simply absent.
+local function clock(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    -- math.floor, not the // operator: mpv runs LuaJIT, which is Lua 5.1 and
+    -- has no floor division. A stock luac accepts it and proves nothing.
+    if seconds >= 3600 then
+        return string.format("%d:%02d:%02d", math.floor(seconds / 3600),
+                             math.floor((seconds % 3600) / 60), seconds % 60)
+    end
+    return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+end
+
+-- Short form for the key row. Long form lives in translate_lines below.
+local function translate_state()
+    local t = mp.get_property_native("user-data/translate_subs")
+    if type(t) ~= "table" or not t.state or t.state == "off" then return "off" end
+    local cues = tonumber(t.cues) or 0
+    if t.state == "probing" then return "checking video" end
+    if t.state == "downloading" then
+        return string.format("fetching audio %d%%",
+                             math.floor(tonumber(t.download_pct) or 0))
+    end
+    if t.state == "loading" or t.state == "starting" then return "starting up" end
+    if t.state == "failed" then return "failed" end
+    if t.state == "done" then
+        return string.format("whole video done, %d lines", cues)
+    end
+    -- Running or idle. Idle means the window in front of the playhead is
+    -- covered, which is the good state, not a stalled one.
+    local ahead = tonumber(t.ahead) or 0
+    return string.format("%s ahead, %d lines", clock(ahead), cues)
+end
+
+-- The detail block. Written because "ahead of playback" and "25% of video"
+-- answer neither question a viewer has: is the part about to be watched
+-- covered, and is anything still being worked on.
+local function translate_lines()
+    local t = mp.get_property_native("user-data/translate_subs")
+    if type(t) ~= "table" or not t.state or t.state == "off" then return nil end
+    local out = {}
+    local cues = tonumber(t.cues) or 0
+    local dur = tonumber(t.duration) or 0
+    local covered = tonumber(t.covered) or 0
+    local ahead = tonumber(t.ahead) or 0
+    local pos = tonumber(t.position) or 0
+    local state = t.state
+
+    local words = {
+        probing = "checking whether the audio is japanese",
+        downloading = string.format("fetching the audio track, %d%%",
+                                    math.floor(tonumber(t.download_pct) or 0)),
+        starting = "starting the worker",
+        loading = "loading the recognition and translation models",
+        running = "transcribing and translating now",
+        idle = "caught up, waiting for playback to move on",
+        done = "finished, the whole video is transcribed",
+        orphaned = "stopped, the player went away",
+        failed = "failed, see the log",
+    }
+    out[#out + 1] = string.format("%-9s %s", "doing", words[state] or state)
+
+    if state ~= "done" and state ~= "failed" and state ~= "probing" then
+        if ahead > 0 then
+            out[#out + 1] = string.format("%-9s %s of subtitles past %s",
+                                          "ahead", clock(ahead), clock(pos))
+        else
+            out[#out + 1] = string.format("%-9s nothing yet at %s, working on it",
+                                          "ahead", clock(pos))
+        end
+    end
+
+    if dur > 0 then
+        out[#out + 1] = string.format("%-9s %s of %s transcribed, %d lines",
+                                      "total", clock(covered), clock(dur), cues)
+    else
+        out[#out + 1] = string.format("%-9s %d lines", "total", cues)
+    end
+    return out
+end
+
 local STATE = {
+    F12 = function() return translate_state() end,
     F1 = function() return shader_active("ArtCNN_C4F32_DS") end,
     F2 = function() return shader_active("ArtCNN_C4F16_DS") end,
     F6 = function() return shader_active("ArtCNN_C4F32_DN") end,
@@ -187,6 +271,17 @@ local function build()
         lines[#lines + 1] = ""
         lines[#lines + 1] = "-- Other --"
         for _, key in ipairs(rest) do row(key, conf[key]) end
+    end
+
+    -- Subtitle generation gets its own row so the progress is findable
+    -- without hunting for the F12 line.
+    local tr = mp.get_property_native("user-data/translate_subs")
+    if type(tr) == "table" and tr.state and tr.state ~= "off" then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "-- Subtitle generation --"
+        for _, l in ipairs(translate_lines() or {}) do
+            lines[#lines + 1] = string.format("%-11s %s", "", l)
+        end
     end
 
     right[#right + 1] = "-- Built-in / scripts --"

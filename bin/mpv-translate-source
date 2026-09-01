@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+"""Japanese speech in a YouTube video -> English subtitle cues, written to a
+growing SRT that mpv reloads.
+
+WHY A SEPARATE AUDIO DOWNLOAD. Anything tapped out of the player arrives at 1x,
+so it can only ever be behind playback. Lookahead has to come from the download
+side. YouTube serves audio as its own stream, so this is not a second copy of
+the video: audio is roughly 2,5% of a video stream's bitrate, and a full hour
+measured 53,4 MB fetched in 4 seconds. No throttling is needed or wanted.
+
+WHY THE WORKER IS HELD BACK. The chain runs at ~30x realtime (Whisper large-v3
+median 29,7x, the translator is free at ~0,1 s per 4 minutes of speech). Only
+~2-3x is needed to stay permanently ahead. The surplus is spent competing with
+the video shaders for the GPU, so the loop idles once it is `lookahead` seconds
+ahead of the playback position instead of racing to the end of the file.
+
+WHY THE ENGLISH FILTER LOOKS AT TEXT, NOT AUDIO. Per-segment audio language ID
+was measured unreliable at cue granularity: on short clips its argmax returns a
+language that is neither Japanese nor English 24% of the time, and thresholding
+p(en) > p(ja) wrongly flags plainly Japanese lines, i.e. it deletes real
+subtitles. Whisper transcribes English speech as latin text even when forced to
+Japanese, so the script ratio of the transcript separates the two cleanly and
+costs nothing. Katakana counts as Japanese on purpose: loanword English sits
+inside Japanese sentences and cutting it fragments the flow.
+"""
+
+import os
+import sys
+
+VENV = os.path.expanduser("~/.local/share/mpv-translate/venv")
+SAMPLE_RATE = 16000
+
+
+def _reexec_into_venv():
+    """Re-run under the feature's venv with the CUDA libs on the loader path.
+
+    The libs are pip wheels, not system packages -- this distro ships no CUDA
+    runtime, and CTranslate2 dies with "Library libcublas.so.12 is not found"
+    without them. Doing it here keeps every caller (mpv, a shell, a test) from
+    having to know.
+    """
+    py = os.path.join(VENV, "bin", "python3")
+    if sys.prefix.startswith(VENV) or not os.path.isfile(py):
+        return
+    env = dict(os.environ)
+    libs = []
+    for pkg in ("cublas", "cudnn"):
+        for site in (os.path.join(VENV, "lib"),):
+            for entry in sorted(os.listdir(site)) if os.path.isdir(site) else []:
+                cand = os.path.join(site, entry, "site-packages", "nvidia", pkg, "lib")
+                if os.path.isdir(cand):
+                    libs.append(cand)
+    if libs:
+        env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(":")
+    os.execve(py, [py] + sys.argv, env)
+
+
+# Only when run as a program. Importing this file (a test, a REPL) must not
+# replace the interpreter out from under the caller.
+if __name__ == "__main__":
+    _reexec_into_venv()
+
+import argparse          # noqa: E402
+import fcntl             # noqa: E402
+import json              # noqa: E402
+import re                # noqa: E402
+import shutil            # noqa: E402
+import subprocess        # noqa: E402
+import tempfile          # noqa: E402
+import time              # noqa: E402
+import unicodedata       # noqa: E402
+
+
+# ------------------------------------------------------------------ helpers
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def yt_dlp(*args, progress=False):
+    """--no-progress is right for the metadata probe and wrong for the
+    download: it suppresses --progress-template too, so asking for machine
+    readable progress while leaving it in silently yields nothing to parse."""
+    base = ["yt-dlp", "--no-warnings"]
+    base.append("--progress" if progress else "--no-progress")
+    return base + list(args)
+
+
+def video_id(url):
+    for pat in (r"[?&]v=([\w-]{6,})",
+                r"youtube\.com/live/([\w-]{6,})",
+                r"youtube\.com/embed/([\w-]{6,})",
+                r"youtu\.be/([\w-]{6,})"):
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def probe(url):
+    out = subprocess.run(yt_dlp("-J", "--skip-download", url),
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError("yt-dlp -J failed: " + (out.stderr.strip().splitlines() or ["?"])[-1])
+    return json.loads(out.stdout)
+
+
+# ------------------------------------------------------- language detection
+
+def detect(meta):
+    """Is the ORIGINAL speech Japanese?
+
+    The `language` field is not trustworthy: a Japanese video on an
+    English-branded channel reports `en-US`. What YouTube does tell us reliably
+    is which language its own ASR ran in -- yt-dlp exposes that as the single
+    `<lang>-orig` key in automatic_captions. That key was correct on a video
+    whose `language` field was wrong, and Whisper's own audio LID agreed with
+    it at p=0,96-0,98.
+    """
+    auto = meta.get("automatic_captions") or {}
+    orig = [k for k in auto if k.endswith("-orig")]
+    if orig:
+        lang = orig[0][:-len("-orig")]
+        return lang.split("-")[0] == "ja", "automatic_captions:%s" % orig[0]
+
+    subs = meta.get("subtitles") or {}
+    if any(k.split("-")[0] == "ja" for k in subs):
+        return True, "subtitles:ja"
+
+    lang = (meta.get("language") or "")
+    if lang.split("-")[0] == "ja":
+        return True, "language:%s" % lang
+    return False, "language:%s" % (lang or "none")
+
+
+def original_audio_format(meta):
+    """Pick the ORIGINAL audio track, never a dub.
+
+    YouTube auto-dubs ship as extra audio-only formats that look identical to
+    the real one apart from `language`; a video was measured carrying eight.
+    Picking by bitrate alone can hand back a German dub, so match the format
+    note yt-dlp writes for the default track and only then prefer bitrate.
+    """
+    cands = [f for f in meta.get("formats", [])
+             if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    if not cands:
+        raise RuntimeError("no audio-only format offered")
+
+    def is_original(f):
+        note = (f.get("format_note") or "").lower()
+        return "original" in note or "default" in note
+
+    marked = [f for f in cands if is_original(f)]
+    pool = marked or cands
+    if not marked:
+        log("no format marked original; falling back to best audio")
+    pool.sort(key=lambda f: (f.get("abr") or 0), reverse=True)
+    return pool[0]["format_id"]
+
+
+# --------------------------------------------------------- English filter
+
+_JA_RANGES = ((0x3040, 0x309F), (0x30A0, 0x30FF), (0x4E00, 0x9FFF),
+              (0x3400, 0x4DBF), (0xFF66, 0xFF9F))
+
+
+def _is_ja_char(ch):
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _JA_RANGES)
+
+
+def latin_ratio(s):
+    ja = la = 0
+    for ch in s:
+        if _is_ja_char(ch):
+            ja += 1
+        elif ch.isascii() and ch.isalpha():
+            la += 1
+        elif unicodedata.category(ch) == "Lo":
+            ja += 1
+    return (la / (la + ja)) if (la + ja) else 0.0
+
+
+# Lines Whisper produces over music, applause and shouting rather than from
+# speech. Only sign-offs addressed to a video audience are listed on purpose: a
+# video really does contain thanks, good night and enjoy your meal, and dropping
+# those would delete real subtitles. The first entry alone can arrive dozens of
+# times over a long video.
+HALLUCINATED_LINES = (
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "ご視聴いただきありがとうございました",
+    "最後までご視聴ありがとうございました",
+    "チャンネル登録お願いします",
+    "チャンネル登録よろしくお願いします",
+    "高評価とチャンネル登録をお願いします",
+    "次回もお楽しみに",
+    "また次の動画でお会いしましょう",
+)
+
+
+def _plain(text):
+    """Fold a line to what it says, so matching cannot be defeated by a comma."""
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in folded
+                   if not ch.isspace() and ch not in "、。！？…‥・「」『』,.!?~〜ー")
+
+
+_HALLUCINATED = frozenset(_plain(line) for line in HALLUCINATED_LINES)
+
+
+def looks_hallucinated(text):
+    """Whole line match only. A substring rule would eat real sentences."""
+    return _plain(text) in _HALLUCINATED
+
+
+# Short acknowledgements. A listener saying one of these is taking a turn of
+# their own, so gluing it onto the speaker's sentence merges two people into a
+# single subtitle.
+_BACKCHANNEL = frozenset(_plain(x) for x in (
+    "はい", "はいはい", "うん", "うんうん", "ううん", "そう", "そうそう",
+    "そうですね", "そうなんですか", "なるほど", "なるほどね", "へえ", "へー",
+    "ええ", "あー", "あ", "おお", "わかる", "わかります", "すごい", "いいね",
+    "まあ", "うーん", "えー", "ふーん", "ほんと", "ほんとに", "ありがとう",
+))
+_SENTENCE_END = "。！？!?…"
+
+
+def is_backchannel(text):
+    t = _plain(text)
+    if not t or len(t) > 12:
+        return False
+    if t in _BACKCHANNEL:
+        return True
+    for unit in ("はい", "うん", "そう", "ええ", "あ", "お", "へ"):
+        if not t.replace(unit, ""):     # a run of one acknowledgement
+            return True
+    return False
+
+
+class TurnGrouper:
+    """Collects recogniser segments into whole clauses before translating.
+
+    WHY. A segment is a couple of seconds long and usually stops mid clause,
+    and Japanese puts the predicate, the negation and the politeness at the
+    END of a sentence. A fragment handed to a sentence level translator
+    therefore often contains nothing to translate, and the model returns a
+    complete, fluent English sentence anyway, inventing whatever it needs.
+    Hundreds of those in a row read as unrelated lines.
+
+    No single boundary signal is usable on its own:
+
+    - Sentence final punctuation appears on 43% of segments in one video and
+      on 0,3% in another, so it cannot be relied on and cannot be ignored.
+    - Segment timestamps are contiguous by construction. Measured 1163 of 1196
+      consecutive segments with a gap of exactly 0,00 s, so the pause has to be
+      taken between the last WORD of one segment and the first of the next.
+      With word timestamps the same boundaries show a median silence of 0,68 s
+      and 58% of them above 0,4 s, which is a real signal.
+    - A short acknowledgement is its own turn and is never merged.
+
+    Plus caps, so one unpunctuated monologue cannot swallow a whole minute.
+    Measured on a one hour conversation: 1216 segments become 806 groups with a
+    median of 2,48 s, against a human subtitle track of 996 cues with a median
+    of 3,15 s. Blind merging without the pause signal gave 10 s cues that mixed
+    two speakers.
+    """
+
+    def __init__(self, max_gap=0.4, max_dur=8.0, max_chars=100):
+        self.max_gap, self.max_dur, self.max_chars = max_gap, max_dur, max_chars
+        self.cur = None
+
+    def _close(self, out):
+        if self.cur:
+            out.append((self.cur["start"], self.cur["end"], self.cur["text"],
+                        self.cur["parts"]))
+            self.cur = None
+
+    def feed(self, start, end, text, words=None):
+        """Take one segment, return whatever groups that completed."""
+        out = []
+        first_word = words[0][0] if words else start
+        last_word = words[-1][1] if words else end
+
+        if is_backchannel(text):
+            self._close(out)
+            out.append((start, end, text, [(start, end, text)]))
+            return out
+
+        if self.cur is None:
+            self.cur = {"start": start, "end": end, "text": text,
+                        "last_word_end": last_word, "parts": [(start, end, text)]}
+        elif (first_word - self.cur["last_word_end"] > self.max_gap
+              or end - self.cur["start"] > self.max_dur
+              or len(self.cur["text"]) + len(text) > self.max_chars):
+            self._close(out)
+            self.cur = {"start": start, "end": end, "text": text,
+                        "last_word_end": last_word, "parts": [(start, end, text)]}
+        else:
+            self.cur["text"] += text
+            self.cur["end"] = end
+            self.cur["last_word_end"] = last_word
+            self.cur["parts"].append((start, end, text))
+
+        if self.cur and self.cur["text"][-1] in _SENTENCE_END:
+            self._close(out)
+        return out
+
+    def flush(self):
+        """Close whatever is open. Called at a chunk edge and on a dropped line."""
+        out = []
+        self._close(out)
+        return out
+
+
+class _NoGrouping:
+    """Stand-in for TurnGrouper when merging is switched off."""
+
+    def feed(self, start, end, text, words=None):
+        return [(start, end, text, [(start, end, text)])]
+
+    def flush(self):
+        return []
+
+
+# ------------------------------------------------------------------ glossary
+
+def load_glossary(path):
+    """Japanese term to English, one tab separated pair per line.
+
+    Proper nouns are the one thing the translator cannot get right by itself,
+    because it transliterates a name it has never seen rather than spelling it.
+    Substituting before translation puts the correct latin string in front of
+    the model, which passes latin text through untouched.
+
+    Longest match first, so a full name wins over a nickname inside it. A
+    missing file is not an error; the feature simply has no glossary.
+    """
+    pairs = []
+    if not path or not os.path.isfile(path):
+        return pairs
+    with open(path, encoding="utf-8") as f:
+        for num, line in enumerate(f, 1):
+            line = line.strip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if "\t" not in line:
+                log("glossary line %d has no tab, ignored: %s" % (num, line[:40]))
+                continue
+            ja, en = line.split("\t", 1)
+            if ja.strip() and en.strip():
+                pairs.append((ja.strip(), en.strip()))
+    pairs.sort(key=lambda pair: -len(pair[0]))
+    log("glossary: %d terms from %s" % (len(pairs), path))
+    return pairs
+
+
+def apply_glossary(text, pairs):
+    for ja, en in pairs:
+        if ja in text:
+            text = text.replace(ja, " " + en + " ")
+    return re.sub(r"\s{2,}", " ", text).strip() if pairs else text
+
+
+def spoken_in_english(text, threshold, min_chars):
+    stripped = "".join(c for c in text if not c.isspace())
+    if len(stripped) < min_chars:
+        return False
+    return latin_ratio(text) > threshold
+
+
+# ------------------------------------------------------------------- SRT
+
+def srt_time(sec):
+    if sec < 0:
+        sec = 0.0
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return "%02d:%02d:%02d,%03d" % (h, m, int(s), round((s - int(s)) * 1000))
+
+
+class SrtFile:
+    """Cue store that rewrites the whole file on every flush.
+
+    Rewriting rather than appending keeps the file correct after a seek, which
+    can produce cues that belong BEFORE ones already written. A few thousand
+    cues is what a long video produces, around 1000 an hour, and
+    rewriting that costs microseconds, so there is no reason to be clever.
+
+    mpv reloads this file, and a reload blanks the currently displayed cue for
+    a few milliseconds. The reload is therefore driven from the mpv side, timed
+    into a gap between cues; nothing here needs to care.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.cues = {}          # start -> (end, text)
+
+    def add(self, start, end, text):
+        self.cues[round(start, 3)] = (end, text)
+
+    def flush(self):
+        items = sorted(self.cues.items())
+
+        # Collapse a line repeated back to back into one longer cue. Speech
+        # recognition emits the same sentence twice when two neighbouring
+        # stretches of audio sound alike, and two identical subtitles in a row
+        # read as a stutter rather than as speech.
+        merged = []
+        for start, (end, text) in items:
+            if merged and merged[-1][2] == text and start - merged[-1][1] <= 1.5:
+                merged[-1][1] = max(merged[-1][1], end)
+                continue
+            merged.append([start, end, text])
+
+        rows = []
+        for i, (start, end, text) in enumerate(merged):
+            nxt = merged[i + 1][0] if i + 1 < len(merged) else None
+            stop = end
+            if nxt is not None and stop > nxt:
+                stop = nxt            # never overlap the following cue
+            if stop <= start:
+                stop = start + 0.4
+            rows.append("%d\n%s --> %s\n%s\n" % (i + 1, srt_time(start), srt_time(stop), text))
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows))
+        os.replace(tmp, self.path)    # atomic: mpv never reads a half file
+
+    def load(self):
+        """Re-read a cached SRT so a resumed run keeps what it already had."""
+        if not os.path.isfile(self.path):
+            return
+        pat = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
+        blocks = open(self.path, encoding="utf-8").read().split("\n\n")
+        for b in blocks:
+            lines = [x for x in b.strip().splitlines() if x.strip()]
+            if len(lines) < 3:
+                continue
+            ts = pat.findall(lines[1])
+            if len(ts) != 2:
+                continue
+            def secs(t):
+                return int(t[0]) * 3600 + int(t[1]) * 60 + int(t[2]) + int(t[3]) / 1000.0
+            self.add(secs(ts[0]), secs(ts[1]), "\n".join(lines[2:]))
+
+
+# ---------------------------------------------------------------- models
+
+class Translator:
+    """Sugoi v4, run through CTranslate2.
+
+    Chosen by comparing four candidates over the same Whisper transcript.
+    It keeps proper nouns, gets domain vocabulary right and preserves
+    negation, where a generic small model blurs specifics. Whisper's own
+    `task=translate` is not an option here for a structural reason as well as a
+    quality one: it produces its OWN segmentation, so its output cannot be
+    aligned to a Japanese transcript at all.
+
+    The source tokens need an explicit end-of-sentence token appended. Without
+    it the decoder degenerates into repetition -- output runs to the length cap
+    and reads as one word repeated, which looks exactly like a broken model
+    rather than a tokenisation mistake.
+    """
+
+    def __init__(self, model_dir, device):
+        import ctranslate2
+        import sentencepiece
+        self.tr = ctranslate2.Translator(model_dir, device=device, compute_type="float16")
+        self.src = sentencepiece.SentencePieceProcessor()
+        self.src.load(os.path.join(model_dir, "spm", "spm.ja.nopretok.model"))
+        self.tgt = sentencepiece.SentencePieceProcessor()
+        self.tgt.load(os.path.join(model_dir, "spm", "spm.en.nopretok.model"))
+
+    def __call__(self, texts):
+        if not texts:
+            return []
+        toks = [self.src.encode(t, out_type=str) + ["</s>"] for t in texts]
+        res = self.tr.translate_batch(
+            toks, beam_size=5, max_batch_size=16,
+            no_repeat_ngram_size=3, max_decoding_length=256)
+        return [self.tgt.decode(r.hypotheses[0]).strip() for r in res]
+
+
+def load_models(opts):
+    from faster_whisper import WhisperModel
+    log("loading asr model %s" % opts.asr_model)
+    asr = WhisperModel(opts.asr_model, device=opts.device, compute_type=opts.compute_type)
+    log("loading translation model")
+    mt = Translator(model_dir_for(opts.mt_model), opts.device)
+    return asr, mt
+
+
+def model_dir_for(repo):
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo)
+
+
+# ---------------------------------------------------------------- worker
+
+class Ranges:
+    """Which parts of the video have actually been transcribed.
+
+    WHY THIS IS NOT A SINGLE HIGH WATER MARK. It was one, and it was wrong.
+    Skipping forward moved the mark to the new position, so everything below it
+    counted as finished even though the skipped stretch had never been looked
+    at. Seeking back into that stretch then produced nothing, permanently,
+    because the worker believed there was no work to do. One video produced
+    401 cues with holes of 193 s, 618 s and 1600 s, every one of them a place
+    that had been skipped past.
+
+    Spans are kept sorted and merged, so a gap is a real gap.
+    """
+
+    def __init__(self, spans=None):
+        self.spans = []
+        for s, e in (spans or []):
+            self.add(s, e)
+
+    def add(self, start, end):
+        if end <= start:
+            return
+        out, placed = [], False
+        for s, e in self.spans:
+            if e < start - 0.01:
+                out.append((s, e))
+            elif s > end + 0.01:
+                if not placed:
+                    out.append((start, end))
+                    placed = True
+                out.append((s, e))
+            else:
+                start, end = min(start, s), max(end, e)
+        if not placed:
+            out.append((start, end))
+        self.spans = sorted(out)
+
+    def covers(self, t):
+        return any(s - 0.01 <= t <= e + 0.01 for s, e in self.spans)
+
+    def first_gap(self, lo, hi):
+        """Earliest uncovered interval inside [lo, hi), or None."""
+        if hi - lo < 1.0:
+            return None
+        cur = lo
+        for s, e in self.spans:
+            if e <= cur:
+                continue
+            if s > cur:
+                return (cur, min(s, hi))
+            cur = e
+            if cur >= hi:
+                return None
+        return (cur, hi) if hi - cur >= 1.0 else None
+
+    def covered_seconds(self):
+        return sum(e - s for s, e in self.spans)
+
+    def save(self, path):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump([[round(s, 3), round(e, 3)] for s, e in self.spans], f)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path):
+        try:
+            with open(path) as f:
+                return cls(json.load(f))
+        except Exception:
+            return cls()
+
+
+class Status:
+    def __init__(self, path):
+        self.path = path
+        self.data = {"state": "starting", "covered": 0.0, "cues": 0,
+                     "suppressed": 0, "hallucinated": 0, "ahead": 0.0, "pos": None,
+                     "duration": 0.0, "download_pct": 0.0,
+                     "error": None}
+
+    def set(self, **kw):
+        self.data.update(kw)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f)
+        os.replace(tmp, self.path)
+
+
+# How long the position file may go unrefreshed before the player is presumed
+# gone. The player rewrites it once a second, and keeps doing so while paused,
+# so silence means the process is not there rather than idle.
+POS_STALE_AFTER = 30.0
+
+
+def parent_gone(pid):
+    """True once the player that asked for this work has exited.
+
+    A player that is QUIT tells the worker to stop. A player that is KILLED
+    cannot, and an orphan holds several gigabytes of video memory and runs the
+    GPU flat out until the whole video is done. Watching the parent is what
+    makes that impossible.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+
+def pos_stale(path):
+    if not path or path == "/dev/null":
+        return False
+    try:
+        return (time.time() - os.path.getmtime(path)) > POS_STALE_AFTER
+    except OSError:
+        return True
+
+
+def watched_to_the_end(srt_path, slack=60.0):
+    """True when the viewer reached the end of this video.
+
+    The cues are worth keeping for ever, the audio is not: once a video has
+    been watched through, the audio is only needed if the viewer comes back to
+    a stretch they skipped, and re-fetching it takes seconds.
+
+    Read from the files rather than from a shutdown hook on purpose. The player
+    aborts the worker rather than asking it to stop, so no code of ours is
+    guaranteed to run at exit, but the last published position and the duration
+    are both already on disk.
+    """
+    try:
+        with open(srt_path + ".pos") as f:
+            pos = float(f.read().strip())
+        with open(srt_path + ".status") as f:
+            dur = float(json.load(f).get("duration") or 0)
+    except Exception:
+        return False
+    return dur > 0 and pos >= dur - slack
+
+
+def ahead_seconds(ranges, pos):
+    """Contiguous transcribed seconds in front of the playhead.
+
+    The useful number to show a viewer. A percentage of the whole video says
+    nothing about whether the next minute has subtitles.
+    """
+    if pos is None:
+        return 0.0
+    for start, end in ranges.spans:
+        if start - 0.01 <= pos <= end + 0.01:
+            return max(0.0, end - pos)
+    return 0.0
+
+
+def prune_audio_cache(directory, max_age_days, max_total_mb=0, keep="",
+                      drop_watched=True):
+    """Bound the cache, by age and by size, and tidy up dead sidecar files.
+
+    Two limits, because either one alone fails. Age alone lets a heavy week
+    grow without bound. Size alone would throw away audio in use this minute.
+
+    Only audio is ever deleted, and that asymmetry is the whole point: the
+    cues cost gpu minutes to rebuild, the audio costs a few seconds to fetch
+    again. Audio is also effectively the entire cache, at around 50 MB per hour
+    of video against roughly 40 KB of cues.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+
+    audio = []
+    for name in names:
+        if not name.endswith(".audio"):
+            continue
+        path = os.path.join(directory, name)
+        if path == keep:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        audio.append([st.st_mtime, st.st_size, path])
+    audio.sort()                       # oldest first
+
+    def drop(entry, why):
+        try:
+            os.remove(entry[2])
+            log("dropped cached audio %s (%.0f MB, %s)"
+                % (os.path.basename(entry[2]), entry[1] / 1e6, why))
+            return True
+        except OSError:
+            return False
+
+    if drop_watched:
+        kept = []
+        for entry in audio:
+            srt_path = entry[2][:-len(".audio")]
+            if watched_to_the_end(srt_path) and drop(entry, "watched to the end"):
+                continue
+            kept.append(entry)
+        audio = kept
+
+    if max_age_days > 0:
+        cutoff = time.time() - max_age_days * 86400
+        kept = []
+        for entry in audio:
+            if entry[0] < cutoff and drop(entry, "untouched"):
+                continue
+            kept.append(entry)
+        audio = kept
+
+    if max_total_mb > 0:
+        budget = max_total_mb * 1e6
+        total = sum(entry[1] for entry in audio)
+        for entry in audio:
+            if total <= budget:
+                break
+            if drop(entry, "over the size budget"):
+                total -= entry[1]
+
+    # A sidecar whose cues are gone is dead weight. The lock file in
+    # particular is created once per video and is otherwise never removed.
+    for name in names:
+        stem, dot, ext = name.rpartition(".")
+        if ext not in ("lock", "status", "pos") or not dot:
+            continue
+        if os.path.isfile(os.path.join(directory, stem)):
+            continue
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def acquire_lock(path, wait_seconds=40.0):
+    """Refuse to be the second worker writing the same subtitle file.
+
+    Two workers sharing an output file ruin it. SrtFile.load() merges whatever
+    is on disk into its own cue store, so two passes over the same audio end up
+    interleaved in one file. Their chunk boundaries do not coincide, and
+    flush() clips every cue to the start of the next one, so the result is a
+    wall of one second subtitles taken from two different transcriptions.
+    Against a single clean pass over the same audio that is 1,74 times the
+    cues, 65% of cue starts that no single pass produces, and 92 copies of one
+    invented line against none.
+
+    A second player opened on the same video does that, and so does an orphan
+    left by a killed player. The lock lives on an open descriptor, so the
+    kernel releases it however the holder dies.
+
+    Waiting beats refusing outright: an orphan gives up within thirty seconds
+    by itself, through the parent watchdog and the position staleness check.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    deadline = time.time() + wait_seconds
+    waited = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            if not waited:
+                log("another worker holds this video, waiting for it to finish")
+                waited = True
+            time.sleep(2.0)
+
+
+def read_pos(path):
+    """Playback position, published by the player once a second.
+
+    Returns None when it cannot be read. That means "position unknown", which
+    switches off the URGENT shortcut but deliberately does NOT switch off
+    pacing -- treating an unknown position as licence to use the whole GPU is
+    how an orphaned worker came to run flat out.
+    """
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except Exception:
+        return None
+
+
+def run(opts):
+    status = Status(opts.out + ".status")
+    lock = acquire_lock(opts.out + ".lock")
+    if lock is None:
+        # Deliberately no status write: the worker that owns this video is
+        # still updating that file and the player is reading it.
+        log("another worker is already transcribing this video, exiting")
+        return
+    try:
+        _run(opts, status)
+    except Exception as e:
+        log("failed: %r" % (e,))
+        status.set(state="failed", error=str(e))
+        raise
+
+
+def _run(opts, status):
+    status.set(state="probing")
+    meta = probe(opts.url)
+    dur = float(meta.get("duration") or 0)
+    status.set(duration=dur)
+
+    srt = SrtFile(opts.out)
+    srt.load()
+    ranges = Ranges.load(opts.out + ".ranges")
+    done_marker = opts.out + ".done"
+
+    if os.path.isfile(done_marker) and os.path.isfile(opts.out):
+        log("cache hit, whole video already transcribed")
+        status.set(state="done", cues=len(srt.cues), covered=dur, duration=dur)
+        return
+    if srt.cues:
+        log("resuming: %d cues, %.0f of %.0f seconds already covered"
+            % (len(srt.cues), ranges.covered_seconds(), dur))
+
+    # Audio is kept next to the cues so a later session does not fetch it
+    # again, and removed once the whole video is transcribed. A full hour is
+    # around 50 MB and it is deleted as soon as it stops being useful.
+    prune_audio_cache(os.path.dirname(opts.out) or ".", opts.audio_cache_days,
+                      opts.audio_cache_mb, keep=opts.out + ".audio")
+
+    audio = opts.out + ".audio"
+    if not os.path.isfile(audio):
+        fmt = original_audio_format(meta)
+        status.set(state="downloading")
+        log("downloading original audio track %s" % fmt)
+        t0 = time.time()
+        tmp = audio + ".part"
+        # --newline plus a machine readable template turns yt-dlp's progress
+        # bar into one parseable line per update, so the player can show a
+        # percentage instead of an opaque wait.
+        proc = subprocess.Popen(
+            yt_dlp("-f", fmt, "-o", tmp, "--newline",
+                   "--progress-template", "PROGRESS %(progress.downloaded_bytes)s "
+                                          "%(progress.total_bytes_estimate)s "
+                                          "%(progress.total_bytes)s",
+                   opts.url, progress=True),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        tail = []
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("PROGRESS "):
+                parts = line.split()
+                try:
+                    got = float(parts[1])
+                    total = next((float(x) for x in parts[2:]
+                                  if x not in ("NA", "None") and float(x) > 0), 0.0)
+                except (ValueError, IndexError):
+                    continue
+                if total > 0:
+                    status.set(download_pct=round(100.0 * got / total, 1))
+            else:
+                tail.append(line)
+        proc.wait()
+        if proc.returncode != 0 or not os.path.isfile(tmp):
+            err = (proc.stderr.read() or "").strip().splitlines() or tail or ["?"]
+            raise RuntimeError("audio download failed: " + err[-1])
+        status.set(download_pct=100.0)
+        os.replace(tmp, audio)
+        log("audio ready in %.1fs" % (time.time() - t0))
+    else:
+        log("reusing cached audio")
+
+    status.set(state="loading")
+    asr, mt = load_models(opts)
+
+    # Decode once and keep the samples. Passing the PATH to transcribe() makes
+    # it decode the whole file on every call, which on an hour long video costs
+    # about 2 s per chunk -- measured 13,0x realtime that way against 17,2x
+    # decoding once, so a third of the time was being spent re-reading audio
+    # already in hand. Cost is roughly 220 MB of RAM per hour of audio.
+    from faster_whisper.audio import decode_audio
+    t0 = time.time()
+    samples = decode_audio(audio, sampling_rate=SAMPLE_RATE)
+    log("decoded %.0f minutes of audio in %.1fs" % (len(samples) / SAMPLE_RATE / 60, time.time() - t0))
+
+    asr_opts = dict(language="ja", task="transcribe",
+                    # VOICE DETECTION IS OFF BY DEFAULT, DELIBERATELY.
+                    # Silero removes what it judges to be non-speech before the
+                    # recogniser sees it, so anything it misjudges yields no
+                    # segment and no cue at all. Against a human subtitle
+                    # track on noisy audio with overlapping voices, detection
+                    # on left 217 s of real speech, 7% of the video, with no
+                    # segment at all, in stretches of up to 24 s. Off, that is
+                    # 85 s and 15 s. Softer detector settings sit in between,
+                    # 252 s and 135 s, at the same speed as off. The price of
+                    # off is throughput, 11,6x realtime against 25,3x, and
+                    # five invented sign-offs against three over 36 minutes,
+                    # which the blocklist already handles. Being ahead of
+                    # playback needs about 3x, so the throughput is spare and
+                    # the missing speech was not.
+                    vad_filter=bool(opts.vad),
+                    condition_on_previous_text=False,
+                    # Segment timestamps are contiguous and say nothing about
+                    # where speech stopped, so the grouper needs word times to
+                    # find a real pause. Measured cost is 3%: 36,3 against
+                    # 35,3 times realtime on the same audio.
+                    word_timestamps=True,
+                    beam_size=opts.beam_size,
+                    no_speech_threshold=opts.no_speech_threshold,
+                    log_prob_threshold=opts.log_prob_threshold)
+
+    suppressed = 0
+    hallucinated = 0
+    glossary = load_glossary(opts.glossary)
+    grouper = (TurnGrouper(opts.merge_gap, opts.merge_max_dur, opts.merge_max_chars)
+               if opts.merge else _NoGrouping())
+    status.set(state="running")
+
+    # The worker now always works towards covering the WHOLE video, and only
+    # varies how fast it does it:
+    #   urgent      -- the playhead is sitting on an uncovered stretch, so the
+    #                  viewer has no subtitles right now. Full speed.
+    #   background  -- everything else. Paced by a duty cycle so the video
+    #                  shaders keep the GPU they need.
+    # Stopping early is what broke seeking before; pacing replaces it.
+    idle_note = False
+    while True:
+        if parent_gone(opts.parent_pid) or pos_stale(opts.pos_file):
+            log("player is gone, stopping")
+            status.set(state="orphaned", cues=len(srt.cues))
+            if watched_to_the_end(opts.out):
+                try:
+                    os.remove(audio)
+                    log("dropped cached audio, the video was watched to the end")
+                except OSError:
+                    pass
+            return
+        pos = read_pos(opts.pos_file)
+
+        # Three tiers, in order of how badly the work is needed:
+        #   behind  -- the viewer is sitting on audio with no subtitles at all.
+        #              Full speed, nothing else matters.
+        #   ahead   -- topping the window up in front of the playhead. Paced.
+        #   fill    -- the rest of the video, for seeking later. Paced, and in
+        #              "ahead" mode not done at all.
+        gap, urgent = None, False
+        if pos is not None:
+            window_end = min(dur, pos + opts.lookahead)
+            g = ranges.first_gap(max(0.0, pos - opts.rewind), window_end)
+            if g:
+                gap = g
+                urgent = not ranges.covers(pos)
+        if gap is None:
+            if opts.fill == "ahead" and pos is not None:
+                # Watching a video through to the end covers all of it, and
+                # then there is genuinely nothing left to do. Without this the
+                # loop would idle forever and never reach the finishing work.
+                if ranges.first_gap(0.0, dur) is None:
+                    break
+                # Window in front of the viewer is complete. Do nothing until
+                # playback moves on. This keeps the card almost idle at the
+                # cost of a short wait when seeking somewhere never visited.
+                if not idle_note:
+                    log("window ahead is covered, idling")
+                    idle_note = True
+                status.set(state="idle", covered=round(ranges.covered_seconds(), 1),
+                           cues=len(srt.cues), suppressed=suppressed, duration=dur,
+                           pos=round(pos, 1) if pos is not None else None,
+                           ahead=round(ahead_seconds(ranges, pos), 1))
+                time.sleep(2.0)
+                continue
+            gap = ranges.first_gap(0.0, dur)
+            if gap is None:
+                break                      # every second accounted for
+        idle_note = False
+        chunk_start = gap[0]
+        chunk_end = min(gap[1], chunk_start + opts.chunk)
+
+        t0 = time.time()
+        clip_start, clip_end = _clip_window(chunk_start, chunk_end, dur,
+                                            opts.min_clip, opts.clip_back)
+        keep_to = max(chunk_end, clip_end)
+        if (clip_start, clip_end) != (chunk_start, chunk_end):
+            log("%s %.0f-%.0fs (widened to %.0f-%.0fs for context)"
+                % ("urgent " if urgent else "filling", chunk_start, chunk_end,
+                   clip_start, clip_end))
+        else:
+            log("%s %.0f-%.0fs" % ("urgent " if urgent else "filling",
+                                   chunk_start, chunk_end))
+        segments = _transcribe_window(asr, samples, clip_start, clip_end, asr_opts)
+
+        batch, reached, aborted = [], chunk_start, False
+        last_emit = time.time()
+        # Pacing happens between segments rather than between chunks. Sleeping
+        # once per chunk meant about twenty seconds of full GPU load followed
+        # by a few seconds of idle, over and over, which is visible as the card
+        # swinging between load levels while watching. A segment is a couple of
+        # seconds of audio, so pausing after each one spreads the same idle
+        # time into slices too short to notice. Chunk size stays large, which
+        # matters because every chunk boundary risks cutting a sentence.
+        paced_from = time.time()
+        for seg_start, seg_end, text, words in segments:
+            # Keep everything the pass produced, not only the requested gap.
+            #
+            # WHY. In ahead mode the gap at the leading edge of the window is
+            # whatever playback has just uncovered, which is one or two
+            # seconds. Transcribing that much and discarding the surrounding
+            # context meant the next second asked for an overlapping window,
+            # so the same sentence was recognised again and again with slightly
+            # different boundaries. Over 90 s of playback that was 174 work
+            # items, one sentence emitted three times, and cues
+            # squeezed to as little as 0,04 s once each was trimmed at the
+            # start of the next. On screen that reads as subtitles that do not
+            # appear at all.
+            #
+            # Keeping the context means one pass covers the gap plus a whole
+            # clip, so the next gap opens a clip length later instead of a
+            # second later. A segment already sitting in a covered stretch is
+            # skipped, because it has its cues from the pass that covered it.
+            middle = (seg_start + seg_end) / 2.0
+            if not (chunk_start <= middle <= keep_to) or ranges.covers(middle):
+                continue
+            if looks_hallucinated(text):
+                hallucinated += 1
+                batch.extend(grouper.flush())   # never merge across a drop
+            elif spoken_in_english(text, opts.latin_threshold, opts.min_chars):
+                suppressed += 1
+                batch.extend(grouper.flush())
+            else:
+                batch.extend(grouper.feed(seg_start, seg_end, text, words))
+            reached = max(reached, min(seg_end, keep_to))
+            if batch and (len(batch) >= opts.batch
+                          or time.time() - last_emit > opts.emit_after):
+                _emit(srt, mt, batch, glossary, opts.split_cues,
+                      opts.max_cue, opts.min_cue, opts.split_min_words)
+                batch = []
+                last_emit = time.time()
+                srt.flush()
+
+            # Re-prioritise the moment the viewer lands somewhere with no
+            # subtitles; finishing this chunk first would leave them staring at
+            # nothing.
+            if not urgent and 0 < opts.duty < 1:
+                work = time.time() - paced_from
+                if work > 0:
+                    time.sleep(min(2.0, work * (1.0 / opts.duty - 1.0)))
+                paced_from = time.time()
+
+            if parent_gone(opts.parent_pid):
+                aborted = True
+                break
+            now_pos = read_pos(opts.pos_file)
+            if (now_pos is not None and not urgent
+                    and not ranges.covers(now_pos) and not (chunk_start <= now_pos <= chunk_end)):
+                aborted = True
+                break
+
+        # A group must not span a chunk edge: the next chunk is a separate
+        # pass over different audio.
+        batch.extend(grouper.flush())
+        if batch:
+            _emit(srt, mt, batch, glossary, opts.split_cues,
+                  opts.max_cue, opts.min_cue, opts.split_min_words)
+        srt.flush()
+
+        # Mark the whole requested window covered, not just where speech was
+        # found. Silence and music produce no cues, and treating them as
+        # uncovered would make the worker retry them forever.
+        ranges.add(chunk_start, reached if aborted else keep_to)
+        ranges.save(opts.out + ".ranges")
+        status.set(covered=round(ranges.covered_seconds(), 1),
+                   cues=len(srt.cues), suppressed=suppressed,
+                   hallucinated=hallucinated, duration=dur, state="running",
+                   pos=round(pos, 1) if pos is not None else None,
+                   ahead=round(ahead_seconds(ranges, read_pos(opts.pos_file)), 1))
+
+
+    srt.flush()
+    open(done_marker, "w").close()
+    try:
+        os.remove(audio)                   # no longer needed, the cues are the cache
+    except OSError:
+        pass
+    status.set(state="done", covered=round(ranges.covered_seconds(), 1),
+               cues=len(srt.cues), suppressed=suppressed,
+               hallucinated=hallucinated, duration=dur)
+    log("done: whole video covered, %d cues, %d english segments suppressed, "
+        "%d invented sign-offs dropped" % (len(srt.cues), suppressed, hallucinated))
+
+
+def _clip_window(gap_start, gap_end, duration, min_clip, back=15.0):
+    """Widen a short window so the recogniser is given acoustic context.
+
+    A very short clip is where Whisper invents its stock closing lines, and
+    window length is not a free choice here: it is whatever gap is left to
+    fill, and a viewer who seeks a lot leaves small ones. Measured over the
+    same twenty minutes of audio, one pass produced no invented line at a
+    hundred and twenty second window, three at thirty and five at eight.
+
+    The extra audio is context only. Cues found outside the requested gap are
+    thrown away, because that stretch already has its own cues and a near
+    duplicate at a slightly different timestamp is precisely what makes a
+    subtitle file unreadable.
+    """
+    end = max(gap_end, gap_start + min_clip)
+    if duration:
+        end = min(duration, end)
+    # A RUNNING START MATTERS. Beginning the clip exactly at the gap cuts
+    # whatever sentence straddles that instant and gives the recogniser a cold
+    # window boundary there. Measured over the same 30 s of audio, a clip
+    # beginning at the gap produced 148 characters where the same audio inside
+    # a pass that had begun earlier produced 271. The lead-in is context only;
+    # it is already covered, so its cues are skipped.
+    start = max(0.0, gap_start - back)
+    return start, max(end, gap_end)
+
+
+def _transcribe_window(asr, samples, start, end, asr_opts):
+    """Transcribe one window, yielding (start, end, text) on the video clock.
+
+    WHY A SLICE RATHER THAN clip_timestamps. faster-whisper documents that
+    `vad_filter` is ignored whenever `clip_timestamps` is given, so selecting
+    the window that way silently disabled voice detection in every run this
+    feature has ever done, leaving only the no-speech and logprob thresholds
+    to hold back invented lines. Handing over a slice keeps the detector, and
+    the timestamps only need the window offset added back.
+
+    Yields word times alongside each segment, because the grouper cannot find
+    a sentence boundary without them.
+
+    On a busy multi speaker video: 840 cues down to 654, three
+    invented cues down to one, seven filler lines down to three, and 13,9 times
+    realtime up to 25,3. Character error rate against a human transcript did
+    not move, 0,0727 against 0,0713, so the speed is not bought with accuracy.
+    """
+    lo = max(0, int(start * SAMPLE_RATE))
+    hi = min(len(samples), int(end * SAMPLE_RATE))
+    segments, _ = asr.transcribe(samples[lo:hi], **asr_opts)
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        words = [(w.start + start, w.end + start) for w in (seg.words or ())]
+        yield (seg.start + start, seg.end + start, text, words)
+
+
+def _break_at_punctuation(words, taken, want, window=2):
+    """Nudge a split onto a punctuation mark if one is close.
+
+    A clause cut mid phrase is what disturbs reading. Only sentence enders
+    count, because a comma is a weak boundary and nudging onto one pulls a two
+    word scrap into a cue of its own, which reads worse than the straight
+    proportional split. Nothing moves further than the window, so the fragment
+    still lines up with the speech it belongs to.
+    """
+    for delta in range(0, window + 1):
+        for cand in ((want - delta), (want + delta)) if delta else (want,):
+            if cand < 2 or taken + cand >= len(words):
+                continue
+            if words[taken + cand - 1][-1] in ".!?":
+                return cand
+    return want
+
+
+def split_over_parts(parts, english, min_words=4):
+    """Show one translated clause on the timings of the speech it came from.
+
+    This is what a human subtitler does, and the reason to do it is that the
+    two goals pull in opposite directions. The translator needs a whole clause
+    or it invents a sentence around a fragment. The viewer needs a cue that
+    appears and disappears with the speech, and a single cue covering the whole
+    clause sits on screen for the length of the clause. Measured on a multi
+    speaker video, one cue per clause put twelve cues over six seconds into a
+    four minute window where showing them on the source timings leaves three.
+
+    Segments are first coalesced so no fragment gets fewer than min_words: a
+    translation shorter than its source cannot be spread over every segment
+    without producing one word flashes. Whatever fragments remain get words in
+    proportion to how much of the Japanese their segments held. The split is
+    approximate, so a fragment can break mid phrase, but each one is readable
+    and the timing is exact.
+    """
+    words = english.split()
+    if not words:
+        return []
+    buckets = max(1, min(len(parts), len(words) // min_words))
+    if buckets < 2:
+        return [(parts[0][0], parts[-1][1], english)]
+
+    # coalesce the segments into that many contiguous groups, by source length
+    weights = [max(1, len(p[2])) for p in parts]
+    total = sum(weights)
+    merged, cur, acc, target = [], None, 0.0, total / buckets
+    for (start, end, src), weight in zip(parts, weights):
+        if cur is None:
+            cur = [start, end, weight]
+        else:
+            cur[1], cur[2] = end, cur[2] + weight
+        acc += weight
+        if len(merged) < buckets - 1 and acc >= target * (len(merged) + 1):
+            merged.append(cur)
+            cur = None
+    if cur is not None:
+        merged.append(cur)
+
+    span_total = sum(m[2] for m in merged)
+    out, taken = [], 0
+    for i, (start, end, weight) in enumerate(merged):
+        if i == len(merged) - 1:
+            chunk = words[taken:]
+        else:
+            want = max(min_words, round(len(words) * weight / span_total))
+            want = _break_at_punctuation(words, taken, want)
+            want = min(want, len(words) - taken - min_words * (len(merged) - 1 - i))
+            chunk = words[taken:taken + max(1, want)]
+        taken += len(chunk)
+        if chunk:
+            out.append((start, end, " ".join(chunk)))
+    return out
+
+
+def _emit(srt, mt, batch, glossary=(), split=True, max_cue=7.0, min_cue=1.0,
+          min_words=4):
+    outs = mt([apply_glossary(b[2], glossary) for b in batch])
+    for group, en in zip(batch, outs):
+        if not en:
+            continue
+        parts = group[3] if len(group) > 3 else [(group[0], group[1], group[2])]
+        cues = (split_over_parts(parts, en, min_words) if split
+                else [(group[0], group[1], en)])
+        for start, end, text in cues:
+            # A cue that outlives its speech is read as a stuck subtitle. One
+            # recogniser segment measured 16,3 s for five words over music, so
+            # the cap is needed whether or not clauses are being grouped.
+            if max_cue > 0:
+                end = min(end, start + max_cue)
+            # And a fragment shorter than this is a flash rather than a
+            # subtitle. Growing it is safe: overlapping the following cue is
+            # trimmed away when the file is written.
+            if min_cue > 0:
+                end = max(end, start + min_cue)
+            srt.add(start, end, text)
+
+
+# ------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("url")
+    ap.add_argument("--detect", action="store_true",
+                    help="print JSON saying whether the original speech is Japanese")
+    ap.add_argument("--out", help="SRT path to write (run mode)")
+    ap.add_argument("--pos-file", default="", help="file the player writes time-pos into")
+    ap.add_argument("--parent-pid", type=int, default=0,
+                    help="exit when this process is gone, so a killed player\ncannot leave the gpu working on nothing")
+    ap.add_argument("--asr-model", default="large-v3")
+    ap.add_argument("--mt-model", default="entai2965/sugoi-v4-ja-en-ctranslate2")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--compute-type", default="float16")
+    ap.add_argument("--beam-size", type=int, default=5)
+    ap.add_argument("--no-speech-threshold", type=float, default=0.6)
+    ap.add_argument("--log-prob-threshold", type=float, default=-1.0)
+    ap.add_argument("--latin-threshold", type=float, default=0.5)
+    ap.add_argument("--min-chars", type=int, default=3)
+    ap.add_argument("--lookahead", type=float, default=180.0,
+                    help="treat a gap this far ahead of the playhead as urgent")
+    ap.add_argument("--rewind", type=float, default=5.0)
+    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--chunk", type=float, default=120.0,
+                    help="seconds of audio per transcription pass")
+    ap.add_argument("--vad", type=int, choices=(0, 1), default=0,
+                    help="voice activity detection. Off by default: it drops\n"
+                         "real speech on noisy audio, which costs whole cues")
+    ap.add_argument("--clip-back", type=float, default=15.0,
+                    help="seconds of already covered audio handed to the\n"
+                         "recogniser before the gap, as a running start")
+    ap.add_argument("--min-clip", type=float, default=120.0,
+                    help="never hand the recogniser less audio than this;\n"
+                         "a short clip is where it invents sign-offs")
+    ap.add_argument("--fill", choices=("whole", "ahead"), default="whole",
+                    help="whole: transcribe the entire video so seeking is "
+                         "instant afterwards. ahead: only keep a window in "
+                         "front of the playhead, leaving the gpu mostly idle")
+    ap.add_argument("--audio-cache-days", type=float, default=7.0,
+                    help="drop cached audio untouched for this long; 0 disables")
+    ap.add_argument("--audio-cache-mb", type=float, default=2000.0,
+                    help="keep total cached audio under this, oldest dropped\n"
+                         "first; 0 disables. The cues are never dropped")
+    ap.add_argument("--glossary",
+                    default=os.path.expanduser("~/.config/mpv/translate-glossary.tsv"),
+                    help="tab separated japanese term and english replacement,\n"
+                         "applied to the source before translation")
+    ap.add_argument("--merge", type=int, choices=(0, 1), default=1,
+                    help="group segments into whole clauses before translating")
+    ap.add_argument("--merge-gap", type=float, default=0.4,
+                    help="silence between words that ends a group")
+    ap.add_argument("--merge-max-dur", type=float, default=8.0)
+    ap.add_argument("--split-cues", type=int, choices=(0, 1), default=1,
+                    help="show a translated clause on the timings of the\n"
+                         "speech it came from, rather than as one long cue")
+    ap.add_argument("--max-cue", type=float, default=7.0,
+                    help="a cue is never displayed longer than this; 0 disables")
+    ap.add_argument("--split-min-words", type=int, default=4,
+                    help="a split fragment never gets fewer words than this")
+    ap.add_argument("--min-cue", type=float, default=1.0,
+                    help="a cue is displayed at least this long, trimmed if the\n"
+                         "next one starts sooner; 0 disables")
+    ap.add_argument("--emit-after", type=float, default=2.5,
+                    help="translate a partial batch after this long, so the\n"
+                         "first subtitle after a seek does not wait for a full one")
+    ap.add_argument("--merge-max-chars", type=int, default=100)
+    ap.add_argument("--duty", type=float, default=0.8,
+                    help="share of wall clock the background fill may use")
+    opts = ap.parse_args()
+
+    if opts.detect:
+        try:
+            meta = probe(opts.url)
+            ja, why = detect(meta)
+            print(json.dumps({"japanese": ja, "reason": why,
+                              "video_id": video_id(opts.url) or meta.get("id"),
+                              "duration": meta.get("duration")}))
+        except Exception as e:
+            print(json.dumps({"japanese": False, "reason": "error", "error": str(e)}))
+        return 0
+
+    if not opts.out:
+        ap.error("--out is required unless --detect is given")
+    run(opts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

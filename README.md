@@ -24,17 +24,17 @@ exist anywhere else. Everything they need is written down below.
 ## What is here and what you have to fetch yourself
 
 Only my own work is committed here, meaning the scripts, the key bindings and the settings
-files. Two things have to be downloaded once before this config works completely.
+files. Three things have to be downloaded once before this config works completely.
 
 ```
 mpv/
   mpv.conf            renderer, shader, cache, auth, window
   input.conf          every key binding
-  scripts/            7 Lua scripts
+  scripts/            8 Lua scripts
   script-opts/        my ModernZ and thumbfast settings
   shaders/            EMPTY, drop the ArtCNN GLSL files in here
   fonts/              EMPTY, drop modernz-icons.ttf in here
-bin/                  4 helper programs
+bin/                  6 helper programs
 config/
   ff2mpv-rust.json    the browser handoff glue
 vendor/
@@ -55,6 +55,9 @@ docs/screenshots/     the pictures in this file
   ModernZ has to live in the user config folder rather than being installed as a package,
   because mpv loads a script of the same name from both places and you end up with two
   controllers stacked on top of each other.
+* **The recognition and translation models**, only if you want the Japanese subtitle feature.
+  Run `bin/mpv-translate-setup` once. It builds its own environment and downloads about 7 GB
+  into `~/.local/share/mpv-translate` and the model cache, all of it outside this clone.
 
 Programs that have to be present are `mpv`, `yt-dlp`, `socat`, `jq`, `python3`, `ffmpeg` for
 emote decoding, `streamlink` with the `streamlink-ttvlol` plugin for Twitch, and
@@ -164,6 +167,51 @@ emotes further off centre with every character. And the panel reads the margins 
 publishes while the controller is visible, so an emote never ends up sitting under the seek
 bar.
 
+## Japanese to English subtitles
+
+**F12** on a Japanese YouTube video adds English subtitles that did not exist before.
+Recognition and translation both run locally on the GPU, ahead of the playback position, and
+the result arrives as an ordinary subtitle track, so the scale, delay and visibility keys all
+work on it.
+
+Whether a video qualifies is read from its automatic caption list, from the single key ending
+in `-orig`, which names the language YouTube's own recogniser ran in. The `language` field
+YouTube reports is not reliable. Only the original audio is downloaded, roughly 50 MB per hour,
+pinned by its format note so an automatic dub is never picked instead. Whisper `large-v3`
+recognises and Sugoi v4 translates, both on the CTranslate2 runtime.
+`bin/mpv-translate-setup` installs them once, about 7 GB of environment and models, into
+`~/.local/share/mpv-translate` and the model cache, outside this clone.
+
+Voice activity detection is off by default. It discards audio before the recogniser sees it and
+takes real speech with it on anything noisy. Turning it on with `vad=yes` roughly halves the
+work and is worth it for clean, quiet recordings.
+
+Work is picked by need rather than in file order. Audio the viewer is sitting on with no
+subtitles is transcribed at full speed, everything else is paced by a duty cycle so the video
+shaders keep the GPU they need, and the `fill` setting decides how far it goes.
+
+* **whole** transcribes the entire video, so seeking anywhere is instant afterwards and the
+  cached audio is dropped once the last second is covered. The card is busy for a few minutes.
+* **ahead** keeps a window in front of the playhead and then idles, which leaves the card
+  almost free, at the cost of a short wait when you seek somewhere never visited.
+
+An optional glossary substitutes names and coined terms into the source before translation, one
+tab separated pair per line.
+
+```
+mpv/translate-glossary.tsv
+```
+
+It is not tracked and a missing file simply means no glossary. Only proper nouns and coined
+words belong in it, since the substitution is blind and an entry for an ordinary word would
+corrupt every sentence that uses the word normally.
+
+Cues live in `~/.local/state/mpv/translate-subs` and are tiny. The audio beside them is not, so
+audio is bounded by age and by total size and dropped once a video has been watched through,
+while cues are never dropped. Progress is published as a user data property that the cheat
+sheet reads, so **h** reports what the worker is doing, how much time of subtitles sits in
+front of the playhead, and how much of the video is done.
+
 ## The upscaler and its pixel budget
 
 An ArtCNN pass costs a fixed amount of work per source pixel and has to be paid once per
@@ -219,6 +267,7 @@ threshold. Both update while the sheet is open.
 | F9 | Queue mode |
 | F10 | Chat overlay, off then beside then over |
 | F11 | Emote animation |
+| F12 | Japanese to English subtitles |
 | h | This cheat sheet |
 | Up and Down | Volume, replacing the default long seek |
 | Plus and Minus | Playback speed, also on the numeric keypad |
@@ -342,7 +391,8 @@ ln -s ~/mpv-config/config/ff2mpv-rust.json ~/.config/ff2mpv-rust.json
 ```
 
 Then fetch ArtCNN and ModernZ as described at the top, create the browser profile symlink, and
-edit the three lines listed below.
+edit the three lines listed below. Run `bin/mpv-translate-setup` as well if you want the
+Japanese subtitle feature.
 
 Symlinks rather than copies, because that is how I run it myself. This clone **is** my live
 configuration, so editing a script and committing it are the same act and the two can never

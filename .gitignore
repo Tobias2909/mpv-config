@@ -19,3 +19,7 @@ __pycache__/
 
 # ModernZ ships its own translations, fetch them with the script.
 mpv/script-opts/modernz-locale.json
+
+# Personal glossary of names and coined terms for the japanese subtitle
+# feature. Content is a matter of taste and is nobody else's business.
+mpv/translate-glossary.tsv
