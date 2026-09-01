@@ -37,6 +37,7 @@ local DESC = {
     ["+"] = "Speed +10%   (also KP_ADD)",
     ["-"] = "Speed -10%   (also KP_SUBTRACT)",
     BS = "Speed back to 1.0x",
+    KP0 = "Restart video from 00:00   (also KP_INS)",
     ESC = "(disabled — does not leave fullscreen)",
 }
 

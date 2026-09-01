@@ -273,6 +273,7 @@ threshold. Both update while the sheet is open.
 | Up and Down | Volume, replacing the default long seek |
 | Plus and Minus | Playback speed, also on the numeric keypad |
 | Backspace | Back to normal speed |
+| Keypad 0 | Back to the start of the video |
 
 Escape is deliberately disabled so that a stray press cannot drop the player out of
 fullscreen.
