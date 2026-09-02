@@ -163,6 +163,33 @@ local POLL        = 0.05      -- seconds between file polls == chat refresh rate
 local FADE_STEPS  = 8
 local FADE_TIME   = 0.20      -- seconds for the fade in/out
 
+-- Japanese chat -> English, by ~/.local/bin/mpv-chat-translate. It follows the
+-- same JSONL the panel reads and appends {"n", "en"} lines to a sidecar file,
+-- keyed by the line number of the message. Nothing here ever waits for it: a
+-- message is drawn in Japanese the moment it is due and switches to English
+-- when its translation lands, which on a live stream happens inside the
+-- smoothing delay chat is already held back by.
+local TR_MODEL     = "entai2965/sugoi-v4-ja-en-ctranslate2"
+local TR_DEVICE    = "cuda"
+-- Measured on the shipping model: 40 msg/s translating one at a time, 286 at
+-- 16, 293 at 32 -- so 16 is where the curve flattens, and a bigger batch only
+-- buys latency (56 ms per batch against 109 ms). The worst chat wall ever
+-- measured here is 8 msg/s, i.e. 3% of this.
+local TR_BATCH     = 16
+-- How long a partly filled batch waits. A trickle of chat is bounded by this,
+-- not by the batch size.
+local TR_FLUSH     = 0.3
+-- A VOD's replay chat downloads hours faster than realtime; translating all of
+-- it up front would spend gpu minutes on chat nobody has reached yet. The
+-- translator stops reading this far ahead of the playhead, which it learns
+-- from the position file written below.
+local TR_LOOKAHEAD = 120
+local TR_POS_EVERY = 1.0      -- seconds between position file writes
+-- Names are the one thing the translator cannot get right, since it
+-- transliterates what it has never seen instead of spelling it. Shared with
+-- the subtitle feature, and simply absent if the file is not there.
+local TR_GLOSSARY  = "~~/translate-glossary.tsv"
+
 local RES_X, RES_Y = 1920, 1080
 
 --------------------------------------------------------------------- state
@@ -201,6 +228,11 @@ local cursor       = 0     -- index of the newest message already shown
 -- before its declaration, so they must be declared here.
 local want_emote   = nil
 local pump_fetch   = nil
+-- Same reason: the poll timer calls it, stop_helper tears it down, and both
+-- are defined above the translation section.
+local tr_poll      = nil
+local stop_translate = nil
+local publish_translate = nil
 local emote_cols   = nil
 local lag_samples  = {}    -- {t = arrival, v = pipeline lag} rolling window
 local smooth_delay = 0     -- current adaptive target, seconds
@@ -210,6 +242,36 @@ local lag_warmup_until = nil  -- ignore lag samples before this wall clock
 local anchor_pos   = nil   -- playback position that wall-clock maps to
 local poll_timer   = nil
 local fade_timer   = nil
+-- Translation. `tr_on` is the live state; `tr_forced` records an explicit key
+-- press for the current file, which is what lets the subtitle feature switch
+-- translation on without overriding a deliberate choice, and lets chat be
+-- translated with no subtitles anywhere in sight.
+local tr_on        = false
+local tr_forced    = nil   -- nil = follow the subtitle feature, else the choice
+local tr_handle    = nil
+local tr_path      = nil   -- sidecar JSONL of translations
+local tr_read      = 0
+local tr_pending   = ""
+local tr_by_n      = {}    -- line number -> English text
+local tr_count     = 0
+-- Per line number: false = Japanese and still untranslated, true = translated.
+-- Keyed by line number rather than counted per record, because a backwards
+-- seek re-ingests the same lines and a plain counter would count them twice.
+local ja_state     = {}
+local ja_total     = 0
+local ja_done      = 0
+-- Japanese messages ON SCREEN right now that are still untranslated. The
+-- plain done/total pair cannot answer "is the chat on screen in English": a
+-- recording buffers its whole chat, hours of it, while the translator
+-- deliberately stops 120 s ahead of the playhead, so the ratio looks broken
+-- when nothing is wrong. Counted over the visible slice at redraw time, which
+-- is at most MAX_SHOW records and needs no bookkeeping that a backwards seek
+-- or a toggle could corrupt.
+local vis_wait     = 0
+local by_n         = {}    -- line number -> record, for late arrivals
+local line_no      = 0     -- non-empty lines read; the key both sides agree on
+local pos_path     = nil   -- playback position, read by the translator
+local pos_next     = 0
 local alpha        = 255   -- 255 = invisible, 0 = opaque
 local target_alpha = 255
 local dirty        = true
@@ -326,7 +388,32 @@ end
 -- Emote labels are glued straight into the text -- ":a::a::a:" or
 -- "guapo:face-red-heart-shape:" -- so splitting on whitespace would never find
 -- them. Scan for the labels the helper reported instead.
+-- `rec.en` is the translated text when translation is on and this message has
+-- come back from the translator. It keeps the emote labels in place, so
+-- everything below is unaffected by which of the two is drawn.
+-- Does this message contain real Japanese? Same ranges the translator itself
+-- triggers on (hiragana, katakana LETTERS, common ideographs), so the counts on
+-- the help sheet match what is actually sent to the model: half width katakana
+-- and the katakana punctuation are excluded because kaomoji are built from
+-- them.
+local function looks_japanese(s)
+    local i = 1
+    while i <= #s do
+        -- ucode_at returns the codepoint and its BYTE LENGTH, not the next
+        -- index -- so the step is i + n, exactly as in uwidth above.
+        local cp, n = ucode_at(s, i)
+        if not cp or n < 1 then return false end
+        if (cp >= 0x3041 and cp <= 0x3096) or (cp >= 0x30A1 and cp <= 0x30FA)
+           or (cp >= 0x4E00 and cp <= 0x9FFF) then
+            return true
+        end
+        i = i + n
+    end
+    return false
+end
+
 local function tokenize(rec, cap, merge)
+    local base = (tr_on and rec.en) or rec.text
     local labels = {}
     if type(rec.e) == "table" then
         for _, e in ipairs(rec.e) do
@@ -337,7 +424,7 @@ local function tokenize(rec, cap, merge)
         end
     end
 
-    local segs = { { text = rec.text } }
+    local segs = { { text = base } }
     for label, url in pairs(labels) do
         local out = {}
         for _, seg in ipairs(segs) do
@@ -520,9 +607,17 @@ local function stop_helper()
         helper = nil
     end
     if poll_timer then poll_timer:kill(); poll_timer = nil end
+    if stop_translate then stop_translate() end
     if path then os.remove(path) end
     path, read_pos, pending = nil, 0, ""
     msgs, vod, cursor = {}, false, 0
+    -- The line numbering belongs to one file, so it restarts with it.
+    by_n, tr_by_n, line_no, tr_count = {}, {}, 0, 0
+    ja_state, ja_total, ja_done = {}, 0, 0
+    vis_wait = 0
+    -- Publish only now: stop_translate() above runs before this reset, so
+    -- publishing there would republish the counts of the file being left.
+    if publish_translate then publish_translate() end
     anchor_a, anchor_pos, last_show_at = nil, nil, nil
     lag_samples, smooth_delay, lag_warmup_until = {}, 0, nil
     -- Redraw NOW. Without this the previous stream's messages stay on screen
@@ -575,9 +670,26 @@ local function live_delay()
     return math.max(smooth_delay, CHAT_DELAY)
 end
 
-local function ingest(line)
+local function ingest(line, n)
     local rec = utils.parse_json(line)
     if type(rec) ~= "table" or type(rec.text) ~= "string" then return end
+    -- Re-reading the file after a backwards seek re-ingests the same lines
+    -- with the same numbers, so a translation that arrived earlier is simply
+    -- picked up again here rather than being lost or re-requested.
+    rec.n, by_n[n], rec.en = n, rec, tr_by_n[n]
+    rec.ja = looks_japanese(rec.text)
+    if rec.ja then
+        if ja_state[n] == nil then
+            ja_state[n] = false
+            ja_total = ja_total + 1
+        end
+        -- The translation can arrive before the line is ingested (a seek, or
+        -- the translator simply reading first), so both sides count.
+        if rec.en and ja_state[n] == false then
+            ja_state[n] = true
+            ja_done = ja_done + 1
+        end
+    end
     local now = mp.get_property_number("time-pos") or 0
 
     if rec.t ~= nil then
@@ -656,7 +768,10 @@ local function poll()
             if not nl then break end
             local line = pending:sub(1, nl - 1)
             pending = pending:sub(nl + 1)
-            if line ~= "" then ingest(line) end
+            if line ~= "" then
+                line_no = line_no + 1
+                ingest(line, line_no)
+            end
         end
         passes = passes + 1
         if far_ahead() then break end
@@ -737,9 +852,186 @@ local function start_helper()
 
     poll_timer = mp.add_periodic_timer(POLL, function()
         poll()
+        tr_poll()
         pump_fetch()
         if dirty then render() end
     end)
+end
+
+----------------------------------------------------------------- translation
+
+local function tr_cmd()
+    local home = os.getenv("HOME") or ""
+    for _, cand in ipairs({ home .. "/mpv-config/bin/mpv-chat-translate",
+                            home .. "/.local/bin/mpv-chat-translate",
+                            "/usr/local/bin/mpv-chat-translate" }) do
+        local info = utils.file_info(cand)
+        if info and info.is_file then return cand end
+    end
+    return "mpv-chat-translate"
+end
+
+-- One property carries the whole translation state, because render() cannot:
+-- it early-returns while chat is hidden, and translation keeps running there.
+-- Read by keyhelp.lua for the sheet's translation area, and by the harness.
+publish_translate = function()
+    mp.set_property_native("user-data/chat_translate",
+                           { on = tr_on, lines = tr_count, seen = line_no,
+                             japanese = ja_total, english = ja_done,
+                             waiting = vis_wait })
+end
+
+stop_translate = function()
+    tr_on = false
+    if tr_handle then
+        mp.abort_async_command(tr_handle)
+        tr_handle = nil
+    end
+    if tr_path then os.remove(tr_path) end
+    if pos_path then os.remove(pos_path) end
+    tr_path, pos_path, tr_read, tr_pending = nil, nil, 0, ""
+end
+
+-- Translations are keyed by line number, so the reader is independent of the
+-- chat reader: it can run behind it, ahead of a redraw, or catch up after a
+-- seek, and every line still lands on the right message.
+tr_poll = function()
+    if tr_on and pos_path and mp.get_time() >= pos_next then
+        pos_next = mp.get_time() + TR_POS_EVERY
+        local f = io.open(pos_path, "w")
+        if f then
+            f:write(string.format("%.3f", mp.get_property_number("time-pos") or 0))
+            f:close()
+        end
+    end
+    if not tr_path then return end
+    local before = tr_count
+    local fh = io.open(tr_path, "r")
+    if not fh then return end
+    fh:seek("set", tr_read)
+    local chunk = fh:read(CHUNK)
+    fh:close()
+    if not chunk or chunk == "" then return end
+    tr_read = tr_read + #chunk
+    tr_pending = tr_pending .. chunk
+    while true do
+        local nl = tr_pending:find("\n", 1, true)
+        if not nl then break end
+        local line = tr_pending:sub(1, nl - 1)
+        tr_pending = tr_pending:sub(nl + 1)
+        local rec = utils.parse_json(line)
+        if type(rec) == "table" and tonumber(rec.n) and type(rec.en) == "string"
+           and rec.en ~= "" then
+            local n = tonumber(rec.n)
+            -- Count DISTINCT lines: switching translation off and on restarts
+            -- the translator, which re-reads the chat from the top and
+            -- re-emits every line it already did, so a plain increment
+            -- reported three times the work after three toggles.
+            if tr_by_n[n] == nil then tr_count = tr_count + 1 end
+            tr_by_n[n] = rec.en
+            if ja_state[n] == false then
+                ja_state[n] = true
+                ja_done = ja_done + 1
+            end
+            local target = by_n[n]
+            if target then
+                target.en = rec.en
+                -- Only a message that is already on screen forces a redraw.
+                -- Most translations land while their message is still buffered
+                -- ahead of the playhead, and those cost nothing.
+                -- `msgs[cursor]` is nil until the first message is due, and
+                -- a live translation can land inside the smoothing delay, so
+                -- this compared a number against nil and threw.
+                local newest = msgs[cursor]
+                if tr_on and newest and newest.n and n <= newest.n then
+                    dirty = true
+                end
+            end
+        end
+    end
+    if tr_count ~= before then publish_translate() end
+end
+
+local function start_translate()
+    if tr_handle or not path then return end
+    tr_path  = path .. ".tr"
+    pos_path = path .. ".pos"
+    os.remove(tr_path)
+    tr_read, tr_pending, pos_next = 0, "", 0
+    local exe  = tr_cmd()
+    local args = { exe, "--in", path, "--out", tr_path,
+                   "--pos-file", pos_path,
+                   "--parent-pid", tostring(utils.getpid()),
+                   "--mt-model", TR_MODEL,
+                   "--device", TR_DEVICE,
+                   "--batch", tostring(TR_BATCH),
+                   "--flush-after", tostring(TR_FLUSH),
+                   "--lookahead", tostring(TR_LOOKAHEAD) }
+    local gloss = mp.command_native({ "expand-path", TR_GLOSSARY })
+    local info  = gloss and utils.file_info(gloss)
+    if info and info.is_file then
+        args[#args + 1] = "--glossary"
+        args[#args + 1] = gloss
+    end
+    msg.info("starting chat translator: " .. exe)
+    local h
+    h = mp.command_native_async({
+        name = "subprocess",
+        args = args,
+        playback_only = false,
+        capture_stdout = false,
+        capture_stderr = true,
+    }, function(success, res, err)
+        if h ~= tr_handle then return end
+        local code = res and res.status
+        if success and code == 0 then
+            msg.info("chat translator stopped")
+            -- Released on purpose, unlike the chat source's handle: a restart
+            -- costs nothing here because the sidecar is rebuilt from the same
+            -- line numbers, while a stale handle would silently refuse one.
+            tr_handle = nil
+            return
+        end
+        local stderr = ((res and res.stderr or ""):match("[^\n]*\n?$")) or ""
+        msg.error("chat translator failed: " .. tostring(err or code) .. " " .. stderr)
+        mp.osd_message("Chat translation failed: " ..
+                       tostring(err or (res and res.error_string) or code) ..
+                       (stderr ~= "" and ("\n" .. stderr) or ""), 6)
+        tr_on, tr_handle = false, nil
+        publish_translate()
+        dirty = true
+    end)
+    tr_handle = h
+end
+
+-- `announce` false when the subtitle feature is what turned this on or off, so
+-- one key press does not produce two messages on screen.
+local function set_translate(on, announce)
+    if on == tr_on then return end
+    -- Translating a chat nobody is looking at would start the source helper,
+    -- and with it a chat download, for a file whose chat was switched off on
+    -- purpose. F12 reaches this path too, so it has to be handled here rather
+    -- than in the key binding.
+    if on and mode == "off" and not path then
+        if announce ~= false then
+            mp.osd_message("Chat is off. Turn it on with F10 first.", 2)
+        end
+        return
+    end
+    tr_on = on
+    if on then
+        if not path then start_helper() end
+        start_translate()
+    else
+        stop_translate()
+    end
+    publish_translate()
+    if announce ~= false then
+        mp.osd_message("Chat translation: " .. (tr_on and "on (Japanese to English)"
+                                                      or "off"), 2)
+    end
+    dirty = true
+    render()
 end
 
 --------------------------------------------------------------------- render
@@ -945,6 +1237,10 @@ function render()
         overlay.data = ""
         overlay:update()
         clear_overlays()
+        if vis_wait ~= 0 then
+            vis_wait = 0
+            publish_translate()
+        end
         return
     end
 
@@ -990,8 +1286,14 @@ function render()
 
     -- Build newest-first until the panel is full, then flip for drawing.
     local list, lines = visible_slice(), {}
+    -- Untranslated Japanese among what is actually DRAWN, counted inside the
+    -- loop below rather than over `list`: the slice holds up to MAX_SHOW
+    -- candidates while the panel fits only `max_ln` rows, so counting the
+    -- slice reported 60 waiting lines for an eight row panel.
+    local wait = 0
     for i = #list, 1, -1 do
         local rec  = list[i]
+        if tr_on and rec.ja and not rec.en then wait = wait + 1 end
         local user = rec.user or "?"
         -- No trailing space: wrap_tokens inserts the separator itself, so
         -- ending the head with ": " would render a double space.
@@ -1004,6 +1306,10 @@ function render()
             if #lines >= max_ln then break end
         end
         if #lines >= max_ln then break end
+    end
+    if wait ~= vis_wait then
+        vis_wait = wait
+        publish_translate()
     end
 
     if #lines == 0 and source then
@@ -1196,6 +1502,7 @@ end
 -- stream's source can still be running even when chat is off.
 mp.register_event("file-loaded", function()
     stop_helper()
+    tr_forced = nil
     local had_chat = (source ~= nil)
     source = detect_source()
     if source then
@@ -1213,6 +1520,7 @@ end)
 -- Publish the starting state so the property exists before the first mode
 -- change (it is read by scripts and by the test harness).
 mp.set_property_native("user-data/chat_mode", mode)
+publish_translate()
 
 mp.register_event("end-file", function()
     stop_helper()
@@ -1257,7 +1565,11 @@ mp.register_event("seek", function()
     -- because the anchor does not move, replaying it recomputes identical
     -- show_at values.
     if #msgs == 0 or now < (msgs[1].show_at or 0) then
+        -- Re-reading assigns the same line numbers again, so translations
+        -- already in tr_by_n are re-attached in ingest() and nothing is
+        -- re-requested.
         read_pos, pending, msgs = 0, "", {}
+        by_n, line_no = {}, 0
     end
     cursor = 0   -- rebuild the walk from scratch; visible_slice re-advances it
     dirty  = true
@@ -1265,6 +1577,30 @@ end)
 
 overlay = mp.create_osd_overlay("ass-events")
 mp.add_key_binding(nil, "toggle", toggle)
+-- Chat translation is INDEPENDENT of the subtitle feature: this key works on
+-- its own, on Twitch as well, and with no subtitles running anywhere.
+mp.add_key_binding(nil, "toggle-translate", function()
+    if not source then source = detect_source() end
+    if not source then
+        mp.osd_message(NO_CHAT_MSG, 2)
+        return
+    end
+    tr_forced = not tr_on
+    set_translate(not tr_on)
+end)
+
+-- Turning on Japanese subtitles turns on Japanese chat translation, because
+-- wanting one and not the other is the unlikely case. It reads the subtitle
+-- feature's published state rather than being called by it, so neither script
+-- knows about the other. An explicit key press wins for the rest of the file:
+-- translation stays on when subtitles are switched off, and stays off when
+-- they are switched on.
+mp.observe_property("user-data/translate_subs", "native", function(_, v)
+    if tr_forced ~= nil or not source then return end
+    local subs_on = type(v) == "table" and v.state ~= nil and v.state ~= "off"
+    set_translate(subs_on and true or false, false)
+end)
+
 mp.add_key_binding(nil, "toggle-anim", function()
     ANIM = not ANIM
     if not ANIM then

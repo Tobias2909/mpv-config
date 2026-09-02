@@ -170,6 +170,33 @@ emotes further off centre with every character. And the panel reads the margins 
 publishes while the controller is visible, so an emote never ends up sitting under the seek
 bar.
 
+### Japanese chat in English
+
+**Shift+F12** translates Japanese chat into English while it scrolls. It works on its own, on
+Twitch as well as on YouTube, and needs no subtitles anywhere. **F12** switches it on as well,
+since wanting Japanese speech translated but not the chat is the unlikely case, and Shift+F12
+then overrides that in either direction for the rest of the file.
+
+`bin/mpv-chat-translate` follows the same line based file the panel reads and appends
+translations to a file of its own, keyed by the line number of the message. Nothing on screen
+ever waits for the graphics card because of that. A message appears in Japanese the moment it
+is due and turns into English when its translation lands, which on a live stream happens well
+inside the delay chat is already held back by. The translator is the same model the subtitle
+feature below uses, so there is no second download and no second setup.
+
+Most messages never reach the model at all. A message with no Japanese letter in it is left
+alone, which is most of a western chat, and a face built out of half width katakana stays a
+face. Around twenty clipped chat words that the model transliterates rather than translates
+are answered from a table instead, and an exact repeat of an earlier message comes from a
+cache. What is left is translated in batches of sixteen, measured at 286 messages a second
+against a worst case chat of 8 messages a second, and it holds around 860 MB of video memory
+while it runs. On a recording it stays 120 seconds ahead of the playback position rather than
+translating a whole stream nobody has watched yet.
+
+Emote labels are lifted out of the text before translation and put back in place afterwards,
+so emotes, the collapsing of repeats and the image slots all behave exactly as they do
+untranslated.
+
 ## Japanese to English subtitles
 
 **F12** on a Japanese YouTube video adds English subtitles that did not exist before.
@@ -271,6 +298,7 @@ threshold. Both update while the sheet is open.
 | F10 | Chat overlay, off then beside then over |
 | F11 | Emote animation |
 | F12 | Japanese to English subtitles |
+| Shift+F12 | Japanese chat to English |
 | h | This cheat sheet |
 | Up and Down | Volume, replacing the default long seek |
 | Plus and Minus | Playback speed, also on the numeric keypad |

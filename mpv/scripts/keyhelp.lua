@@ -32,6 +32,7 @@ local DESC = {
     F10 = "Chat: off -> beside -> over (streams only)",
     F11 = "Chat emote animation on/off",
     F12 = "Japanese to English subtitles (YouTube)",
+    ["Shift+F12"] = "Japanese chat to English (F12 too)",
     UP = "Volume +5",
     DOWN = "Volume -5",
     ["+"] = "Speed +10%   (also KP_ADD)",
@@ -42,7 +43,8 @@ local DESC = {
 }
 
 -- Duplicates of a key already described above; parsed but not shown twice.
-local SKIP = { KP_ADD = true, KP_SUBTRACT = true }
+-- KP_INS is the same binding as KP0 and its row already says so.
+local SKIP = { KP_ADD = true, KP_SUBTRACT = true, KP_INS = true }
 
 -- Which shader file is loaded right now. The shader keys are no longer a
 -- "press F1 for the default" bank: mpv.conf's [light-shader] profile picks F1's
@@ -130,7 +132,7 @@ local function translate_lines()
         orphaned = "stopped, the player went away",
         failed = "failed, see the log",
     }
-    out[#out + 1] = string.format("%-9s %s", "doing", words[state] or state)
+    out[#out + 1] = string.format("%-9s %s", "subs", words[state] or state)
 
     if state ~= "done" and state ~= "failed" and state ~= "probing" then
         if ahead > 0 then
@@ -151,8 +153,52 @@ local function translate_lines()
     return out
 end
 
+-- Chat translation, published by chat_overlay.lua as one table. Same
+-- one-way read as above: no property, no rows.
+local function chat_state()
+    local c = mp.get_property_native("user-data/chat_translate")
+    if type(c) ~= "table" or not c.on then return nil end
+    return c, tonumber(c.japanese) or 0, tonumber(c.english) or 0,
+           tonumber(c.lines) or 0, tonumber(c.seen) or 0,
+           tonumber(c.waiting) or 0
+end
+
+local function chat_translate_state()
+    local c, ja, _, _, _, waiting = chat_state()
+    if not c then return "off" end
+    if ja == 0 then return "on, no japanese yet" end
+    -- What is on screen is what can be judged; the totals include chat
+    -- buffered hours ahead, which the translator will not touch until
+    -- playback gets there.
+    if waiting > 0 then return string.format("on, %d lines on screen waiting", waiting) end
+    return "on, screen is in english"
+end
+
+local function chat_lines()
+    local c, ja, en, _, seen, waiting = chat_state()
+    if not c then return nil end
+    local out = {}
+    local doing
+    if ja == 0 then
+        doing = "nothing japanese in the chat so far"
+    elseif waiting > 0 then
+        doing = string.format("%d japanese lines on screen are not translated yet",
+                              waiting)
+    else
+        doing = "every japanese line on screen is in english"
+    end
+    out[#out + 1] = string.format("%-9s %s", "chat", doing)
+    -- The totals count the whole buffer, which on a recording runs hours past
+    -- the playhead on purpose, so they are stated as a buffer figure rather
+    -- than as progress.
+    out[#out + 1] = string.format("%-9s %d translated, %d japanese of %d messages buffered",
+                                  "chat", en, ja, seen)
+    return out
+end
+
 local STATE = {
     F12 = function() return translate_state() end,
+    ["Shift+F12"] = function() return chat_translate_state() end,
     F1 = function() return shader_active("ArtCNN_C4F32_DS") end,
     F2 = function() return shader_active("ArtCNN_C4F16_DS") end,
     F6 = function() return shader_active("ArtCNN_C4F32_DN") end,
@@ -170,12 +216,25 @@ local STATE = {
     end,
 }
 
+-- Both translation features share one area, because they are one topic and
+-- their progress rows read together: the subtitle worker and the chat
+-- translator are answering the same question about different text.
+local function translation_notes()
+    local out = {}
+    for _, l in ipairs(translate_lines() or {}) do out[#out + 1] = l end
+    for _, l in ipairs(chat_lines() or {}) do out[#out + 1] = l end
+    if #out == 0 then return nil end
+    return out
+end
+
 -- Display order. Keys parsed from input.conf but not named here land in "Other",
 -- so nothing can silently go missing.
--- Third element (optional) = function returning a footnote row for the group.
+-- Third element (optional) = function returning the group's footnote, either
+-- one row or a list of rows.
 local GROUPS = {
     { "Upscaler / picture", { "F1", "F2", "F6", "F7", "F8", "F5" }, pixel_rate_note },
     { "Playback",           { "F4", "UP", "DOWN", "+", "-", "BS" } },
+    { "Translation",        { "F12", "Shift+F12" }, translation_notes },
     { "Queue / loop",       { "F9" } },
     { "Info",               { "F3" } },
 }
@@ -259,7 +318,10 @@ local function build()
             end
         end
         local note = group[3] and group[3]()
-        if note then lines[#lines + 1] = string.format("%-11s %s", "", note) end
+        if type(note) == "string" then note = { note } end
+        for _, n in ipairs(note or {}) do
+            lines[#lines + 1] = string.format("%-11s %s", "", n)
+        end
     end
 
     -- Anything bound in input.conf that no group claims.
@@ -272,17 +334,6 @@ local function build()
         lines[#lines + 1] = ""
         lines[#lines + 1] = "-- Other --"
         for _, key in ipairs(rest) do row(key, conf[key]) end
-    end
-
-    -- Subtitle generation gets its own row so the progress is findable
-    -- without hunting for the F12 line.
-    local tr = mp.get_property_native("user-data/translate_subs")
-    if type(tr) == "table" and tr.state and tr.state ~= "off" then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "-- Subtitle generation --"
-        for _, l in ipairs(translate_lines() or {}) do
-            lines[#lines + 1] = string.format("%-11s %s", "", l)
-        end
     end
 
     right[#right + 1] = "-- Built-in / scripts --"
@@ -316,7 +367,10 @@ local function build()
         charw = fs * 0.62
         xr = xl + math.ceil(widest(lines) * charw) + 28
         w = xr - 24 + math.ceil(widest(right) * charw) + 28
-        if w <= avail then break end
+        -- Both directions, or the sheet runs off the BOTTOM instead: the two
+        -- progress blocks add rows exactly when they matter, and shrinking
+        -- only for width left a 41 row sheet 100 units taller than the canvas.
+        if w <= avail and rows * (size + 3) + 24 <= 700 then break end
     end
     local step = fs + 3
     local hgt = rows * step + 24
@@ -362,5 +416,15 @@ mp.observe_property("glsl-shaders", "native", function()
     if shown then build() ; overlay:update() end
 end)
 mp.observe_property("video-params", "native", function()
+    if shown then build() ; overlay:update() end
+end)
+-- Both translation blocks are progress, so they go stale within a second of
+-- being drawn. The subtitle worker republishes about once a second and the
+-- chat translator only when a line lands, so this rebuilds no more often than
+-- the numbers actually change.
+mp.observe_property("user-data/translate_subs", "native", function()
+    if shown then build() ; overlay:update() end
+end)
+mp.observe_property("user-data/chat_translate", "native", function()
     if shown then build() ; overlay:update() end
 end)

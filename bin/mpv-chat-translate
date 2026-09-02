@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Japanese live chat -> English, as a sidecar to the chat overlay's JSONL.
+
+WHY A SIDECAR AND NOT A FILTER. mpv-chat-source could translate before it
+writes, but then every message would wait for the GPU before it could be drawn,
+a restart of the translator would restart the chat download (a VOD's replay
+chat is a finite fetch of the WHOLE track), and turning translation off would
+mean losing the buffered chat. So this process only ever appends
+{"n": <line number>, "en": "..."} to its own file, keyed by the line number of
+the message in the chat JSONL, and the player attaches translations to messages
+it has long since drawn. A message is shown in Japanese the moment it arrives
+and switches to English when its translation lands, typically inside the
+smoothing delay the overlay already holds live chat back by.
+
+WHY THE LINE NUMBER IS THE KEY. Chat has no message ids across platforms, and
+byte offsets change nothing but grow the file. Both sides count non empty lines
+of the same append only file, so the numbering cannot drift; a line one side
+fails to parse simply never gets a translation.
+
+WHY MOST MESSAGES NEVER REACH THE MODEL. Chat is short, repetitive and often
+already English. Three filters run before the GPU: no Japanese character at all
+(most of a western stream's chat), the message is nothing but emotes, and an
+exact repeat of a string already translated. What is left is batched, so the
+model sees whole batches of short sequences rather than one line at a time.
+
+WHY THE MODEL IS LOADED LATE. An all English chat never loads it, so the toggle
+costs no video memory until there is Japanese to translate.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_worker():
+    """Import the subtitle worker as a module, for the parts both share.
+
+    It imports nothing heavy at module level and guards its own venv re exec
+    behind __main__, so importing it here is free and does not replace this
+    interpreter. Sharing it means one Translator, one glossary loader and one
+    definition of what counts as a Japanese character.
+    """
+    path = os.path.join(HERE, "mpv-translate-source")
+    if not os.path.isfile(path):
+        path = os.path.expanduser("~/.local/bin/mpv-translate-source")
+    # A loader has to be named explicitly: the file has no .py suffix, and
+    # spec_from_file_location picks a loader by extension, returning None here.
+    loader = importlib.machinery.SourceFileLoader("mpv_translate_source", path)
+    spec = importlib.util.spec_from_file_location("mpv_translate_source", path,
+                                                  loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+W = _load_worker()
+
+# The re exec puts the CUDA wheels on the loader path and switches to the
+# feature's venv; it rebuilds this process's own argv, so it has to happen
+# before anything heavy is imported and only when run as a program.
+if __name__ == "__main__":
+    W._reexec_into_venv()
+
+import argparse          # noqa: E402
+import json              # noqa: E402
+import re                # noqa: E402
+import signal            # noqa: E402
+import time              # noqa: E402
+import unicodedata       # noqa: E402
+
+log = W.log
+
+# Chat spellings the translator has no chance with, because they are not words.
+# A model trained on prose renders the first two literally (the grass one as
+# "grass") and drops the rest, so they are rewritten before it sees them.
+# Order matters: the longest patterns first, and the laughter forms before the
+# generic repeated character collapse below.
+SLANG = (
+    (re.compile(r"^[wWｗ]{1,}$"), "lol"),
+    (re.compile(r"[wWｗ]{2,}"), " lol "),
+    (re.compile(r"草+"), " lol "),
+    (re.compile(r"[8８]{3,}"), " clap "),
+    (re.compile(r"[?？]{2,}"), "? "),
+    (re.compile(r"[!！]{2,}"), "! "),
+)
+# A run of the same character is emphasis, not repetition the model should
+# reproduce ("cuteeeee" style). Three or more collapse to two, which keeps the
+# emphasis visible without derailing the decoder.
+RUN = re.compile(r"(.)\1{2,}", re.DOTALL)
+
+# Chat one liners the model TRANSLITERATES instead of translating, because
+# they are clipped forms that do not occur in prose. Measured on the shipping
+# model, standalone: it returns "Wakotsu", "Otsu", "Kamimawa", "Uta frame",
+# "Spacha", "Hatsumi", "Erai", "Urugi", "Egui", "Ponkotsu" -- readable only to
+# someone who already knows the word.
+#
+# These are matched against a WHOLE text segment, never substituted inside a
+# sentence. Substituting inside one is measurably worse, because the model does
+# not pass a common English noun through, it re-translates it: an injected
+# "stream" came back as "dream" and "commentary" as "Comementary".
+# Full sentences are left to the model, which handles them well.
+#
+# A hit also costs no gpu at all, and these are among the most frequent
+# messages in a Japanese chat.
+CANNED = {
+    "わこつ": "thanks for streaming",
+    "うぽつ": "thanks for the upload",
+    "おつ": "good work",
+    "おつー": "good work",
+    "おつです": "good work",
+    "乙": "good work",
+    "神回": "legendary episode",
+    "歌枠": "singing stream",
+    "スパチャ": "superchat",
+    "初見": "first time here",
+    "待機": "waiting",
+    "助かる": "that helps",
+    "定期": "as usual",
+    "尊い": "precious",
+    "えらい": "well done",
+    "うますぎ": "too good",
+    "えぐい": "insane",
+    "ぽんこつ": "clumsy",
+    "語彙力": "words fail me",
+}
+# Trailing decoration a chat message wears on its own ("おつー！！", "尊い～").
+CANNED_TAIL = "!?~-\u3001\u3002\uff5e\u30fc\u2026 "
+
+MAX_CACHE = 20000
+
+
+def normalise(text):
+    """Chat spelling -> something the translator can read."""
+    # NFKC folds full width latin and half width katakana into the forms the
+    # model was trained on. It runs first so the slang patterns only need one
+    # spelling each.
+    text = unicodedata.normalize("NFKC", text)
+    for pat, repl in SLANG:
+        text = pat.sub(repl, text)
+    # After the named patterns, never before: collapsing first would shorten an
+    # applause run below the length its own pattern matches.
+    text = RUN.sub(r"\1\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def split_labels(text, emotes):
+    """Text -> alternating list of {"t": str} and {"k": label} parts.
+
+    Emotes are matched by their literal label inside the message text, which is
+    exactly how the player finds them when it draws the message. Translating
+    the label along with the sentence would destroy it, so labels are lifted
+    out here and put back afterwards, in place, and the sentence around them is
+    all that is translated.
+    """
+    labels = []
+    for e in emotes or ():
+        if isinstance(e, dict) and isinstance(e.get("label"), str) and e["label"]:
+            labels.append(e["label"])
+    # Longest first: one label can be a prefix of another.
+    labels.sort(key=len, reverse=True)
+    parts = [{"t": text}]
+    for label in labels:
+        out = []
+        for part in parts:
+            if "k" in part:
+                out.append(part)
+                continue
+            chunk = part["t"]
+            while True:
+                at = chunk.find(label)
+                if at < 0:
+                    break
+                if at:
+                    out.append({"t": chunk[:at]})
+                out.append({"k": label})
+                chunk = chunk[at + len(label):]
+            if chunk:
+                out.append({"t": chunk})
+        parts = out
+    return parts
+
+
+# Deliberately NARROWER than the subtitle worker's test, which also counts
+# half width katakana and the rarer ideograph block. Chat is full of kaomoji
+# built out of half width katakana and greek letters ("(\uff89*\u0424\u03c9\u0424)\uff89"), and
+# handing one to the translator produces confident nonsense out of a face that
+# was already perfectly readable. Requiring hiragana, full width katakana or a
+# common ideograph keeps real Japanese and leaves faces alone.
+# The ranges hold LETTERS only, not the punctuation that shares their blocks:
+# the katakana middle dot and the prolonged sound mark are what kaomoji are
+# assembled from ("(\u00b4\u30fb\u03c9\u30fb\uff40)"), and a word that really uses them also
+# contains a letter.
+JA_TRIGGER = ((0x3041, 0x3096), (0x30A1, 0x30FA), (0x4E00, 0x9FFF))
+
+
+def has_ja(text):
+    return any(any(lo <= ord(ch) <= hi for lo, hi in JA_TRIGGER) for ch in text)
+
+
+class Batcher:
+    """Collects text segments, translates them in one call, writes the lines.
+
+    A batch is what makes this cheap: the model is called with up to `size`
+    short sequences at once. `flush_after` bounds how long the first message of
+    a quiet chat waits, so a trickle is not held back by an unfilled batch.
+    """
+
+    def __init__(self, out, translate, size=16, flush_after=0.3):
+        self.out = out
+        self.translate = translate
+        self.size = size
+        self.flush_after = flush_after
+        self.jobs = []          # {"n": int, "parts": [...], "todo": [(idx, str)]}
+        self.first = None
+        self.cache = {}
+        self.hits = 0
+        self.done = 0
+
+    def add(self, n, parts, todo):
+        self.jobs.append({"n": n, "parts": parts, "todo": todo})
+        if self.first is None:
+            self.first = time.time()
+        if self.pending() >= self.size:
+            self.flush()
+
+    def pending(self):
+        return sum(len(job["todo"]) for job in self.jobs)
+
+    def due(self):
+        return self.jobs and self.first is not None \
+            and (time.time() - self.first) >= self.flush_after
+
+    def flush(self):
+        if not self.jobs:
+            return
+        want, index = [], []
+        for job in self.jobs:
+            for idx, src in job["todo"]:
+                if src in self.cache:
+                    self.hits += 1
+                    job["parts"][idx]["t"] = self.cache[src]
+                else:
+                    want.append(src)
+                    index.append((job, idx, src))
+        if want:
+            # Duplicates inside one batch are common in chat (the same reaction
+            # from twenty people), so they are collapsed here as well as across
+            # batches.
+            uniq = list(dict.fromkeys(want))
+            got = self.translate(uniq)
+            table = dict(zip(uniq, got))
+            if len(self.cache) > MAX_CACHE:
+                self.cache.clear()
+            self.cache.update(table)
+            for job, idx, src in index:
+                job["parts"][idx]["t"] = table.get(src, src)
+        for job in self.jobs:
+            # Join with a space wherever a label meets a word: the segments are
+            # individually stripped, and a label glued to a word reads badly
+            # even though the player would still find and draw it.
+            text = ""
+            for part in job["parts"]:
+                piece = part.get("t") or part.get("k") or ""
+                if not piece:
+                    continue
+                if text and not text[-1].isspace() and not piece[0].isspace():
+                    text += " "
+                text += piece
+            text = re.sub(r"\s{2,}", " ", text).strip()
+            self.out.write(json.dumps({"n": job["n"], "en": text},
+                                      ensure_ascii=False) + "\n")
+            self.done += 1
+        self.jobs, self.first = [], None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="src", required=True, help="chat JSONL to follow")
+    ap.add_argument("--out", required=True, help="sidecar JSONL of translations")
+    ap.add_argument("--pos-file", default="", help="file the player writes time-pos into")
+    ap.add_argument("--parent-pid", type=int, default=0)
+    ap.add_argument("--mt-model", default="entai2965/sugoi-v4-ja-en-ctranslate2")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--glossary", default="")
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--flush-after", type=float, default=0.3)
+    ap.add_argument("--lookahead", type=float, default=120.0,
+                    help="on a VOD, stop reading this far ahead of playback")
+    ap.add_argument("--poll", type=float, default=0.2)
+    opts = ap.parse_args()
+
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_a: stop.update(now=True))
+    signal.signal(signal.SIGINT, lambda *_a: stop.update(now=True))
+
+    glossary = W.load_glossary(opts.glossary)
+    model = {"mt": None}
+
+    def translate(texts):
+        if model["mt"] is None:
+            log("loading translation model")
+            t0 = time.time()
+            model["mt"] = W.Translator(W.model_dir_for(opts.mt_model), opts.device)
+            log("model ready in %.1f s" % (time.time() - t0))
+        return model["mt"](texts)
+
+    out = open(opts.out, "a", encoding="utf-8", buffering=1)
+    batch = Batcher(out, translate, size=opts.batch, flush_after=opts.flush_after)
+
+    read_pos, pending, line_no = 0, b"", 0
+    seen = skipped = 0
+    held = None            # a VOD record read but not yet due, kept for later
+    last_report = time.time()
+
+    while not stop["now"]:
+        if W.parent_gone(opts.parent_pid):
+            log("player gone, stopping")
+            break
+
+        pos = W.read_pos(opts.pos_file) if opts.pos_file else None
+
+        # A VOD's replay chat downloads hours faster than realtime. Reading it
+        # all would translate a whole stream's chat up front, so reading stops
+        # while the newest record sits further than `lookahead` ahead of the
+        # playhead and resumes as playback catches up. Live chat has no
+        # runahead and is never held.
+        if held is not None:
+            when, n, rec = held
+            if pos is None or when <= pos + opts.lookahead:
+                handle(rec, n, batch, glossary)
+                held = None
+
+        if held is None:
+            # Read as BYTES and keep a byte offset: a text stream's seek only
+            # accepts a cookie from its own tell(), so counting decoded
+            # characters would desynchronise on the first multibyte message.
+            try:
+                fh = open(opts.src, "rb")
+            except OSError:
+                fh = None
+            if fh:
+                fh.seek(read_pos)
+                chunk = fh.read(262144)
+                fh.close()
+                if chunk:
+                    read_pos += len(chunk)
+                    pending += chunk
+                while b"\n" in pending and held is None:
+                    raw, pending = pending.split(b"\n", 1)
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace")
+                    line_no += 1
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(rec, dict) or not isinstance(rec.get("text"), str):
+                        continue
+                    seen += 1
+                    when = rec.get("t")
+                    if when is not None and pos is not None \
+                       and float(when) > pos + opts.lookahead:
+                        held = (float(when), line_no, rec)   # when, n, record
+                        break
+                    if not handle(rec, line_no, batch, glossary):
+                        skipped += 1
+
+        if batch.due() or (stop["now"] and batch.jobs):
+            batch.flush()
+
+        if time.time() - last_report > 60 and seen:
+            log("chat: %d seen, %d translated, %d skipped, %d cache hits"
+                % (seen, batch.done, skipped, batch.hits))
+            last_report = time.time()
+
+        time.sleep(opts.poll)
+
+    batch.flush()
+    out.close()
+    log("chat translate stopped: %d seen, %d translated, %d skipped, %d cache hits"
+        % (seen, batch.done, skipped, batch.hits))
+
+
+def handle(rec, n, batch, glossary):
+    """Queue one message for translation. False when nothing was queued."""
+    # The cheapest filter first, on the raw text: a message with no Japanese
+    # character in it is left completely alone. That is most of a western
+    # stream's chat, and it also stops the chat rewrites above from firing on
+    # English text that happens to contain a run of w or of digits.
+    if not has_ja(rec["text"]):
+        return False
+    parts = split_labels(rec["text"], rec.get("e"))
+    todo, any_text, rewritten = [], False, False
+    for idx, part in enumerate(parts):
+        if "k" in part:
+            continue
+        text = normalise(part["t"])
+        rewritten = rewritten or (text != part["t"].strip())
+        part["t"] = text
+        if not text:
+            continue
+        any_text = True
+        canned = CANNED.get(text) or CANNED.get(text.rstrip(CANNED_TAIL))
+        if canned:
+            part["t"] = canned
+            rewritten = True
+        elif has_ja(text):
+            # Names are the one thing the model cannot get right, because it
+            # transliterates what it has never seen instead of spelling it.
+            # Substituting first puts the correct latin string in front of it,
+            # and latin text passes through untouched.
+            src = W.apply_glossary(text, glossary)
+            if has_ja(src):
+                todo.append((idx, src))
+            else:
+                part["t"] = src
+    if not todo:
+        # Nothing for the model. A message with no Japanese in it is left
+        # alone entirely, which is what keeps an English chat free: emitting
+        # nothing means the player keeps drawing the original text. The one
+        # exception is a message the rewrites above already turned into
+        # English on their own, a laughter or applause run, which is emitted
+        # without ever touching the GPU.
+        if any_text and rewritten:
+            batch.add(n, parts, [])
+        return False
+    batch.add(n, parts, todo)
+    return True
+
+
+if __name__ == "__main__":
+    main()
