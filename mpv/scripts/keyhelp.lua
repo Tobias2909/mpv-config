@@ -239,6 +239,19 @@ local GROUPS = {
     { "Info",               { "F3" } },
 }
 
+-- Groups that live in the RIGHT column, under the built-ins, together with
+-- the leftover section. The live state blocks appear exactly when something is
+-- running, and the left column had no room for them: it stood at 34 rows idle
+-- and 39 with both of them, which crossed a font size step, so the whole sheet
+-- got smaller the moment a translation was switched on. The right column had
+-- nothing but slack, and these groups are the ones nobody reads mid video.
+--
+-- Keep what goes here NARROW, around 54 cells. The box is as wide as both
+-- columns together and the width is the tight dimension, not the height: at
+-- font size 14 there are about three cells of room left over, against eleven
+-- spare rows.
+local RIGHT_SIDE = { ["Queue / loop"] = true, ["Info"] = true }
+
 -- Not from input.conf: mpv defaults and script bindings worth remembering here.
 local BUILTIN = {
     { "?",            "FULL binding list (built-in stats script)" },
@@ -297,7 +310,7 @@ local function build()
     local conf = parse_input_conf()
     -- Two columns: own bindings left, built-ins right. One column at a legible
     -- font size overflowed the 720-unit canvas (39 rows).
-    local lines, right = { "KEY BINDINGS" }, {}
+    local lines, right = { "KEY BINDINGS" }, { "-- Built-in / scripts --" }
     local used = {}
 
     local function row(key, desc, state, into)
@@ -307,20 +320,23 @@ local function build()
         into[#into + 1] = text
     end
 
+    for _, b in ipairs(BUILTIN) do row(b[1], b[2], nil, right) end
+
     for _, group in ipairs(GROUPS) do
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "-- " .. group[1] .. " --"
+        local into = RIGHT_SIDE[group[1]] and right or lines
+        into[#into + 1] = ""
+        into[#into + 1] = "-- " .. group[1] .. " --"
         for _, key in ipairs(group[2]) do
             local desc = conf[key] or DESC[key]
             if desc then
                 used[key] = true
-                row(key, desc, STATE[key] and STATE[key]() or nil)
+                row(key, desc, STATE[key] and STATE[key]() or nil, into)
             end
         end
         local note = group[3] and group[3]()
         if type(note) == "string" then note = { note } end
         for _, n in ipairs(note or {}) do
-            lines[#lines + 1] = string.format("%-11s %s", "", n)
+            into[#into + 1] = string.format("%-11s %s", "", n)
         end
     end
 
@@ -331,13 +347,11 @@ local function build()
     end
     table.sort(rest)
     if #rest > 0 then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = "-- Other --"
-        for _, key in ipairs(rest) do row(key, conf[key]) end
+        right[#right + 1] = ""
+        right[#right + 1] = "-- Other --"
+        for _, key in ipairs(rest) do row(key, conf[key], nil, right) end
     end
 
-    right[#right + 1] = "-- Built-in / scripts --"
-    for _, b in ipairs(BUILTIN) do row(b[1], b[2], nil, right) end
     right[#right + 1] = ""
     right[#right + 1] = KEY .. " closes this"
 
@@ -362,7 +376,7 @@ local function build()
     local avail = 720 * aspect - 48
     local xl = 38
     local fs, charw, xr, w
-    for size = 16, 10, -1 do
+    for size = 14, 10, -1 do
         fs = size
         charw = fs * 0.62
         xr = xl + math.ceil(widest(lines) * charw) + 28
