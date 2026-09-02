@@ -34,6 +34,9 @@ ipc() { printf '%s\n' "$1" | socat -t "${2:-0.5}" - "UNIX-CONNECT:$SOCK" 2>/dev/
 
 # Title hint for the OSD; defaults to original URL, overwritten for Twitch.
 TITLE=""
+# Twitch channel login, when the URL was a Twitch one. `set -u` is on, so
+# every reader of this needs it to exist even when it never gets a value.
+TWITCH_LOGIN=""
 
 # YouTube URL canonicalization -------------------------------------------------
 # ff2mpv hands over whatever href the page had. YouTube's "continue watching"
@@ -67,13 +70,27 @@ fi
 if [[ "$URL" =~ ^https?://(www\.)?twitch\.tv/([^/?#]+) ]]; then
     CHANNEL="${BASH_REMATCH[2]}"
     if command -v streamlink >/dev/null 2>&1; then
-        # --stream-url prints the resolved HLS m3u8 and exits without playing.
+        # --json prints the resolved HLS m3u8 AND the channel's metadata, so
+        # the title costs nothing over the --stream-url call this used to make.
         # The TTV-LOL plugin (AUR streamlink-ttvlol) overrides the upstream
         # twitch plugin so this call transparently goes through the proxy.
-        RESOLVED="$(streamlink --stream-url --twitch-disable-ads "$URL" best 2>/dev/null)"
+        SL_JSON="$(streamlink --json --twitch-disable-ads "$URL" best 2>/dev/null)"
+        RESOLVED="$(jq -r '.url // empty' <<<"$SL_JSON" 2>/dev/null)"
         if [[ -n "$RESOLVED" ]]; then
             URL="$RESOLVED"
-            TITLE="twitch.tv/$CHANNEL"
+            # "Channel — what the stream is called  ·  Category". The resolved
+            # m3u8 carries no channel name at all, which is why this used to
+            # be the bare twitch.tv/<channel> the player had nothing better
+            # than. Whatever the channel left blank is left out.
+            TITLE="$(jq -r '[.metadata.author, .metadata.title]
+                             | map(select(. != null and . != ""))
+                             | join(" — ")' <<<"$SL_JSON" 2>/dev/null)"
+            SL_CATEGORY="$(jq -r '.metadata.category // empty' <<<"$SL_JSON" 2>/dev/null)"
+            [[ -n "$TITLE" && -n "$SL_CATEGORY" ]] && TITLE="$TITLE  ·  $SL_CATEGORY"
+            [[ -z "$TITLE" ]] && TITLE="twitch.tv/$CHANNEL"
+            # The chat overlay used to read the channel back out of the title.
+            # It is told directly now, since the title no longer contains it.
+            TWITCH_LOGIN="$CHANNEL"
         fi
         # On failure: fall through with original URL → mpv+yt-dlp path.
     fi
@@ -164,7 +181,18 @@ if is_alive; then
     # showing the channel name as its title. An empty per-file value resets it
     # to the real title (verified: global "twitch.tv/FAKE" -> per-file
     # "force-media-title=" -> media-title reads "clip.mp4").
-    OPTS="force-media-title=$TITLE"
+    # mpv's per-file option list is comma separated and a stream title is
+    # free to contain commas, so the value goes through mpv's own fixed length
+    # quoting. The length is in BYTES, which is not what ${#TITLE} counts once
+    # the title is Japanese.
+    TITLE_BYTES="$(printf '%s' "$TITLE" | wc -c)"
+    OPTS="force-media-title=%${TITLE_BYTES}%${TITLE}"
+    # Before the loadfile on purpose: IPC commands are handled in order, so the
+    # overlay has the channel by the time the file it belongs to is loaded.
+    if [[ -n "$TWITCH_LOGIN" ]]; then
+        ipc "$(jq -c -n --arg c "$TWITCH_LOGIN" \
+            '{command:["script-message","twitch-channel",$c]}')" >/dev/null || true
+    fi
     cmd="$(jq -c -n --arg url "$URL" --arg f "$FLAGS" --arg opts "$OPTS" \
         '{command:["loadfile",$url,$f,0,$opts]}')"
     printf '%s\n' "$cmd" | socat -t 1 - "UNIX-CONNECT:$SOCK" >/dev/null
@@ -197,6 +225,9 @@ EXTRA=()
 ((QUEUE)) && EXTRA+=(--loop-playlist=inf)
 ((WANT_PLAYLIST)) && EXTRA+=(--ytdl-raw-options-append=yes-playlist=)
 ((IS_MIX)) && EXTRA+=(--ytdl-raw-options-append=playlist-end=$MIX_LIMIT)
+# Same channel name, for an instance that does not exist yet. Appended rather
+# than set, so it cannot drop a script option that came from a config file.
+[[ -n "$TWITCH_LOGIN" ]] && EXTRA+=(--script-opts-append=twitch_channel=$TWITCH_LOGIN)
 if [[ -n "$TITLE" ]]; then
     setsid mpv --input-ipc-server="$SOCK" --force-media-title="$TITLE" "${EXTRA[@]}" -- "$URL" \
         >/dev/null 2>&1 &

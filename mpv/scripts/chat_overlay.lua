@@ -216,6 +216,13 @@ local osc_t, osc_b = 0, 0
 
 local overlay      = nil
 local source       = nil   -- { platform = "twitch"|"youtube", target = "..." }
+-- Twitch channel login for the file being played, and the one announced for
+-- the file that is about to be. The wrapper resolves a Twitch URL to an m3u8
+-- that carries the channel name NOWHERE, and it now titles the stream with
+-- what the channel is actually streaming instead of the bare URL, so the name
+-- is handed over directly rather than read back out of the title.
+local twitch_login = nil
+local twitch_next  = nil
 local helper       = nil   -- async subprocess handle
 local path         = nil   -- JSONL file the helper appends to
 local read_pos     = 0
@@ -558,13 +565,12 @@ end
 
 ------------------------------------------------------------------ detection
 
--- `path` is authoritative; media-title is NOT.
--- The wrapper starts mpv with a GLOBAL --force-media-title=twitch.tv/<chan>
--- whenever the first URL is a Twitch stream, and that value survives every
--- later file in the session (a YouTube handoff passes no title option). So a
--- YouTube video in a session that began on Twitch still reports
--- media-title = twitch.tv/<chan>. Checking the title first reconnected the
--- Twitch chat over a YouTube stream.
+-- `path` is authoritative; media-title is NOT, and neither is a script option.
+-- The wrapper starts mpv with a GLOBAL forced title whenever the first URL is
+-- a Twitch stream, and both that and --script-opts survive every later file in
+-- the session (a YouTube handoff passes no title option). So a YouTube video
+-- in a session that began on Twitch still reports the channel's title.
+-- Checking the title first reconnected the Twitch chat over a YouTube stream.
 -- Does this YouTube video actually HAVE chat? mpv already knows: ytdl_hook
 -- turns yt-dlp's subtitle list into tracks, and a live stream or a was-live
 -- VOD with replay carries one whose `lang` is exactly "live_chat". A plain
@@ -581,6 +587,12 @@ local function youtube_has_chat()
     return false
 end
 
+-- Sent by the wrapper before its loadfile, so it is here in time. mpv keeps
+-- IPC commands in order, which is what makes "before" reliable.
+mp.register_script_message("twitch-channel", function(login)
+    twitch_next = (login ~= "" and login) or nil
+end)
+
 local function detect_source()
     local p = mp.get_property("path") or ""
 
@@ -589,12 +601,21 @@ local function detect_source()
         return { platform = "youtube", target = p }
     end
 
-    -- Twitch arrives as a streamlink m3u8, so the channel lives only in the
-    -- title -- but only trust the title when the path really is that stream.
+    -- Twitch arrives as a streamlink m3u8, which names the channel nowhere,
+    -- so the name has to come from outside the path: the wrapper's handover
+    -- first, then the script option it uses for an instance it had to start,
+    -- and last a title still shaped like the URL, which is what mpv started
+    -- by hand on a resolved m3u8 has. Only ever for a path that really is
+    -- that stream.
     if p:match("%.m3u8") or p:match("ttvnw%.net") then
-        local chan = (mp.get_property("media-title") or "")
-                         :match("^twitch%.tv/([%w_]+)")
-        if chan then return { platform = "twitch", target = chan } end
+        local chan = twitch_login or mp.get_opt("twitch_channel")
+        if not chan or chan == "" then
+            chan = (mp.get_property("media-title") or "")
+                       :match("^twitch%.tv/([%w_]+)")
+        end
+        if chan and chan ~= "" then
+            return { platform = "twitch", target = chan }
+        end
     end
 
     -- Twitch URL handed to mpv directly (streamlink missing).
@@ -1544,6 +1565,10 @@ end
 mp.register_event("file-loaded", function()
     stop_helper()
     tr_forced = nil
+    -- One handover belongs to one file. Taken here rather than in the message
+    -- handler because detect_source runs again later, from the chat key and
+    -- from a seek, long after the title it used to read has been replaced.
+    twitch_login, twitch_next = twitch_next, nil
     local had_chat = (source ~= nil)
     source = detect_source()
     if source then

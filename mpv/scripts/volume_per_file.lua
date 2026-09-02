@@ -57,9 +57,22 @@ end
 --     a `&list=` playlist or a mix are different URLs but must share a volume;
 --     mpv's own watch_later hashing does not do this, hence our own key.
 --   * Twitch -> the channel. The wrapper resolves a channel to a fresh HLS
---     m3u8 on every launch, so `path` is useless as a key; `force-media-title`
---     is the readable `twitch.tv/<channel>` the wrapper sets.
+--     m3u8 on every launch, so `path` is useless as a key, and the m3u8 names
+--     the channel nowhere. The wrapper hands the name over instead, by a
+--     script message for a player that is already running and a script option
+--     for one it starts. It titles the stream with what the channel is
+--     streaming now, so the old trick of reading the name back out of
+--     `force-media-title` only still works for an mpv started by hand.
 --   * everything else -> the path or URL as-is.
+-- Handed over by the wrapper before its loadfile; taken at file-loaded, so
+-- one handover belongs to one file.
+local twitch_login = nil
+local twitch_next  = nil
+
+mp.register_script_message("twitch-channel", function(login)
+    twitch_next = (login ~= "" and login) or nil
+end)
+
 local function identity()
     local path = mp.get_property("path") or ""
     if path == "" then return nil end
@@ -76,9 +89,16 @@ local function identity()
     end
     if id then return "yt:" .. id end
 
-    local chan = (mp.get_property("force-media-title") or "")
-                 :match("^twitch%.tv/([^%s/]+)")
-    if chan then return "twitch:" .. chan:lower() end
+    local chan = twitch_login or mp.get_opt("twitch_channel")
+    if not chan or chan == "" then
+        chan = (mp.get_property("force-media-title") or "")
+               :match("^twitch%.tv/([^%s/]+)")
+    end
+    -- A script option outlives the file it came with, so it only counts while
+    -- the path really is a resolved stream.
+    if chan and chan ~= "" and (path:match("%.m3u8") or path:match("ttvnw%.net")) then
+        return "twitch:" .. chan:lower()
+    end
 
     return path
 end
@@ -136,6 +156,7 @@ mp.register_event("file-loaded", function()
     -- belongs to the file being left, not the one arriving.
     flush()
 
+    twitch_login, twitch_next = twitch_next, nil
     key = identity()
     if not key then return end
 

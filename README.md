@@ -108,7 +108,10 @@ lives.
 * **Twitch goes through streamlink.** A Twitch URL is resolved to a direct HLS playlist by
   `streamlink` first and only then handed to mpv. With the `streamlink-ttvlol` plugin
   installed this also strips the ads that Twitch stitches into the stream itself, which no
-  browser blocker can remove.
+  browser blocker can remove. The same call reports what the channel is streaming, so the
+  player shows the channel name, the title of the stream and its category rather than the
+  bare URL a resolved playlist would otherwise be called. That playlist names the channel
+  nowhere, so the name is handed to the chat overlay and the volume store directly.
 
 ![A YouTube playlist expanded in the player](docs/screenshots/playlist.jpg)
 
