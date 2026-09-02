@@ -21,6 +21,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -414,8 +415,40 @@ def yt_handle_record(rec, sink):
         sink.emit(author, text, t=t, e=emojis, w=w)
 
 
+# mpv aborts the helper with SIGKILL (mode change, file change, quit), so the
+# finally-block below cannot be the only cleanup. The dir name therefore
+# carries the owning pid: any sibling whose pid is gone is provably stale and
+# gets reaped by the next run. A live pid is left alone even though it may be
+# an unrelated process after pid reuse -- leaking a dir is cheaper than
+# deleting a running helper's data.
+TMP_PREFIX = "mpv-chat-"
+
+
+def _sweep_stale_tmpdirs():
+    root = tempfile.gettempdir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(TMP_PREFIX):
+            continue
+        pid = name[len(TMP_PREFIX):].split("-", 1)[0]
+        if not pid.isdigit():
+            continue
+        try:
+            os.kill(int(pid), 0)
+            continue                      # still running, not ours to remove
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue                      # EPERM: alive under another user
+        shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
 def run_youtube(url, sink):
-    tmpdir = tempfile.mkdtemp(prefix="mpv-chat-")
+    _sweep_stale_tmpdirs()
+    tmpdir = tempfile.mkdtemp(prefix="%s%d-" % (TMP_PREFIX, os.getpid()))
     base = os.path.join(tmpdir, "c")
     cmd = ["yt-dlp", "--no-warnings", "--skip-download",
            "--write-subs", "--sub-langs", "live_chat", "-o", base, url]
@@ -468,6 +501,17 @@ def run_youtube(url, sink):
                 proc.kill()
             except Exception:
                 pass
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        # yt-dlp's live_chat.json is a raw copy of the chat and it is BIG (one
+        # VOD measured 66 MB), /tmp is tmpfs, and every run made its own
+        # mkdtemp -- so each played VOD leaked that much RAM until reboot.
+        # Nothing needs it after this point: the messages were already parsed
+        # into the sink's jsonl.
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():
