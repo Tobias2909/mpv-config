@@ -684,8 +684,26 @@ local function start_helper()
         if h ~= helper or mode == "off" then return end
         local detail = err or (res and res.error_string) or "?"
         local code   = res and res.status
+        -- A clean exit is NOT a failure. A YouTube VOD's replay chat is a
+        -- FINITE download: yt-dlp fetches the whole live_chat.json, renames
+        -- it and exits, so the helper reaches EOF and exits 0 -- minutes in,
+        -- which is why this looked like a delayed error. Nothing is lost:
+        -- every message is already in the jsonl and poll() keeps handing it
+        -- to the panel in playback time. Same for a live stream that ends.
+        -- `helper` deliberately stays set: start_helper() bails on a non-nil
+        -- handle, and letting a mode cycle restart it would reset the buffer
+        -- and re-download the entire chat.
         if success and code == 0 then
-            detail = "helper exited"
+            if read_pos == 0 and #msgs == 0 then
+                -- Exited without ever producing a line. detect_source() only
+                -- starts the helper when a live_chat track exists, so this is
+                -- yt-dlp finding no chat after all -- say that, not "failed".
+                msg.warn("chat source exited without any message")
+                mp.osd_message(NO_CHAT_MSG, 2)
+            else
+                msg.info("chat source finished, whole chat buffered")
+            end
+            return
         end
         local stderr = res and res.stderr or ""
         stderr = stderr:match("^[^\n]*") or ""
