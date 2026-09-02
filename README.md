@@ -193,6 +193,12 @@ against a worst case chat of 8 messages a second, and it holds around 860 MB of 
 while it runs. On a recording it stays 120 seconds ahead of the playback position rather than
 translating a whole stream nobody has watched yet.
 
+The video title is translated here as well, on the same key, so a video watched with Japanese
+speech left alone still carries an English title. Only one of the two features ever does that
+work. With subtitles on, their worker already has the title and this one leaves it be, which
+also keeps the chat model out of video memory until the first Japanese message actually
+arrives.
+
 Emote labels are lifted out of the text before translation and put back in place afterwards,
 so emotes, the collapsing of repeats and the image slots all behave exactly as they do
 untranslated.
@@ -203,6 +209,14 @@ untranslated.
 Recognition and translation both run locally on the GPU, ahead of the playback position, and
 the result arrives as an ordinary subtitle track, so the scale, delay and visibility keys all
 work on it.
+
+The title is translated as well. It is the one line that is read before the video even starts
+and no subtitle covers it, so the English title takes the place of the Japanese one in the on
+screen controls and in the window title. It costs a single line through the translator, which
+is loaded for the subtitles anyway, so it appears while the audio is still downloading, and it
+is cached beside the cues, which makes a second viewing instant. A title that is already
+English is left alone, and switching translation off puts the original back. Set
+`translate_title=no` to always keep the original.
 
 Whether a video qualifies is read from its automatic caption list, from the single key ending
 in `-orig`, which names the language YouTube's own recogniser ran in. The `language` field

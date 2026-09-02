@@ -369,6 +369,47 @@ def spoken_in_english(text, threshold, min_chars):
     return latin_ratio(text) > threshold
 
 
+# ------------------------------------------------------------------- title
+
+def title_cache_path(out):
+    return out + ".title"
+
+
+def cached_title(path, title_ja):
+    """The english title from an earlier viewing, if it still belongs to this
+    video. A channel can rename a video after it was watched, so the japanese
+    source is stored beside the translation and compared before it is used."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("ja") != title_ja:
+        return None
+    return (data.get("en") or "").strip() or None
+
+
+def store_title(path, title_ja, title_en):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ja": title_ja, "en": title_en},
+                               ensure_ascii=False))
+        os.replace(tmp, path)
+    except OSError as e:
+        log("could not store the translated title: %r" % (e,))
+
+
+def translate_title(mt, title, glossary):
+    """A title goes through the translator whole.
+
+    It is one line with no context around it, so none of the clause grouping
+    the subtitles need applies. The bracketed decorations a title carries
+    instead of sentences are passed through by the model, and the glossary
+    matters more here than anywhere else, since a title is mostly names."""
+    return mt([apply_glossary(title, glossary)])[0].strip() or None
+
+
 # ------------------------------------------------------------------- SRT
 
 def srt_time(sec):
@@ -482,12 +523,13 @@ class Translator:
         return [self.tgt.decode(r.hypotheses[0]).strip() for r in res]
 
 
-def load_models(opts):
+def load_models(opts, mt=None):
     from faster_whisper import WhisperModel
     log("loading asr model %s" % opts.asr_model)
     asr = WhisperModel(opts.asr_model, device=opts.device, compute_type=opts.compute_type)
-    log("loading translation model")
-    mt = Translator(model_dir_for(opts.mt_model), opts.device)
+    if mt is None:
+        log("loading translation model")
+        mt = Translator(model_dir_for(opts.mt_model), opts.device)
     return asr, mt
 
 
@@ -577,6 +619,7 @@ class Status:
         self.data = {"state": "starting", "covered": 0.0, "cues": 0,
                      "suppressed": 0, "hallucinated": 0, "ahead": 0.0, "pos": None,
                      "duration": 0.0, "download_pct": 0.0,
+                     "title": None, "title_en": None,
                      "error": None}
 
     def set(self, **kw):
@@ -811,6 +854,34 @@ def _run(opts, status):
     dur = float(meta.get("duration") or 0)
     status.set(duration=dur)
 
+    glossary = load_glossary(opts.glossary)
+
+    # The title is translated before anything else happens, because it is the
+    # one line that is read before the video even starts. It costs a single
+    # sentence through the translator, which is loaded here rather than with
+    # the recogniser later on, and the result is kept beside the cues so that
+    # a second viewing shows it without touching the models at all.
+    mt = None
+    title_en = None
+    title_ja = (meta.get("title") or "").strip()
+    if title_ja:
+        status.set(title=title_ja)
+    if opts.translate_title and title_ja:
+        title_en = cached_title(title_cache_path(opts.out), title_ja)
+        if title_en:
+            log("english title from cache: %s" % title_en)
+        elif spoken_in_english(title_ja, opts.latin_threshold, opts.min_chars):
+            log("title is already english, left as it is")
+        else:
+            status.set(state="loading")
+            mt = Translator(model_dir_for(opts.mt_model), opts.device)
+            title_en = translate_title(mt, title_ja, glossary)
+            if title_en:
+                store_title(title_cache_path(opts.out), title_ja, title_en)
+                log("english title: %s" % title_en)
+        if title_en:
+            status.set(title_en=title_en)
+
     srt = SrtFile(opts.out)
     srt.load()
     ranges = Ranges.load(opts.out + ".ranges")
@@ -873,7 +944,7 @@ def _run(opts, status):
         log("reusing cached audio")
 
     status.set(state="loading")
-    asr, mt = load_models(opts)
+    asr, mt = load_models(opts, mt)
 
     # Decode once and keep the samples. Passing the PATH to transcribe() makes
     # it decode the whole file on every call, which on an hour long video costs
@@ -913,7 +984,6 @@ def _run(opts, status):
 
     suppressed = 0
     hallucinated = 0
-    glossary = load_glossary(opts.glossary)
     grouper = (TurnGrouper(opts.merge_gap, opts.merge_max_dur, opts.merge_max_chars)
                if opts.merge else _NoGrouping())
     status.set(state="running")
@@ -1313,6 +1383,9 @@ def main():
     ap.add_argument("--merge-max-chars", type=int, default=100)
     ap.add_argument("--duty", type=float, default=0.8,
                     help="share of wall clock the background fill may use")
+    ap.add_argument("--translate-title", type=int, choices=(0, 1), default=1,
+                    help="translate the video title too and publish it in the\n"
+                         "status file, for the player to show")
     opts = ap.parse_args()
 
     if opts.detect:

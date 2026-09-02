@@ -106,6 +106,9 @@ local o = {
     duty = 0.8,
     -- restart transcription this far before the playback position after a seek
     rewind = 5,
+    -- translate the video title as well and show that instead of the japanese
+    -- one, in the on screen controls and in the window title
+    translate_title = true,
 
     -- never reload the subtitle file more often than this
     reload_interval = 20,
@@ -245,7 +248,72 @@ local function publish()
         -- whether the next minute is covered.
         ahead = job.ahead or 0,
         position = job.last_pos or 0,
+        title = job.title or "",
+        title_en = job.title_en or "",
     })
+end
+
+-- SHOWING THE TRANSLATED TITLE. force-media-title is what the on screen
+-- controls and the window title read, so overriding it puts the english title
+-- everywhere the japanese one was, with no second widget to place.
+--
+-- Two things can produce that english title: this script's own worker, and
+-- the chat translator, which has the same model loaded and translates the
+-- title too when it runs on its own. This script owns the property either
+-- way, so there is exactly one writer; the chat side only publishes a string
+-- and never touches the video. The subtitle worker wins when both have one,
+-- which costs nothing, since both translate the same line with the same model.
+--
+-- TWO THINGS HAVE TO BE REMEMBERED, not one:
+--   * what the option held BEFORE, because it is not always empty. A Twitch
+--     session starts mpv with a global force-media-title, and the chat
+--     overlay reads the channel name back out of it, so clearing it blindly
+--     on a file load would disconnect that chat.
+--   * what the title LOOKED like, because setting the option back to an empty
+--     string does not restore the displayed title of the file that is already
+--     playing. mpv keeps showing the forced value until the next file loads,
+--     so switching off mid file has to write the original string back.
+local title = { applied = false, shown = nil, before = nil, original = nil }
+
+-- The english title to show right now, or nil when there is none.
+local function want_title()
+    if not o.translate_title then return nil end
+    if job and type(job.title_en) == "string" and job.title_en ~= "" then
+        return job.title_en
+    end
+    local c = mp.get_property_native("user-data/chat_translate")
+    if type(c) == "table" and type(c.title_en) == "string" and c.title_en ~= "" then
+        return c.title_en
+    end
+    return nil
+end
+
+local function refresh_title()
+    local en = want_title()
+    if en then
+        if not title.applied then
+            title.before = mp.get_property("force-media-title") or ""
+            title.original = mp.get_property("media-title") or ""
+            title.applied = true
+            mp.osd_message("Title: " .. en, 4)
+        end
+        if title.shown ~= en then
+            mp.set_property("force-media-title", en)
+            title.shown = en
+        end
+    elseif title.applied then
+        mp.set_property("force-media-title", title.original or "")
+        title.applied, title.shown = false, nil
+    end
+end
+
+-- On a file load an empty value IS honoured, so this is where the override is
+-- really dropped -- back to whatever was there before it, not to empty.
+local function release_title()
+    if title.applied then
+        mp.set_property("force-media-title", title.before or "")
+    end
+    title.applied, title.shown, title.before, title.original = false, nil, nil, nil
 end
 
 local function stop(quiet)
@@ -271,6 +339,9 @@ local function stop(quiet)
         if sid then mp.commandv("sub-remove", sid) end
         job = nil
         if not quiet then mp.osd_message("Translation off", 2) end
+        -- After job is cleared, so the chat translator's title takes over if
+        -- that is still running, and the original comes back if it is not.
+        refresh_title()
     end
     publish()
 end
@@ -308,6 +379,11 @@ local function poll()
             job.duration = tonumber(st.duration) or job.duration
             job.download_pct = tonumber(st.download_pct) or job.download_pct
             job.ahead = tonumber(st.ahead) or job.ahead
+            job.title = st.title or job.title
+            if type(st.title_en) == "string" and st.title_en ~= "" then
+                job.title_en = st.title_en
+                refresh_title()
+            end
         end
     end
 
@@ -396,6 +472,7 @@ local function start()
                    "--fill", tostring(o.fill),
                    "--audio-cache-days", tostring(o.audio_cache_days),
                    "--duty", tostring(o.duty),
+                   "--translate-title", o.translate_title and "1" or "0",
                    "--min-chars", tostring(o.min_chars) }
     if o.glossary ~= "" then
         table.insert(args, "--glossary")
@@ -456,7 +533,14 @@ end
 
 mp.register_event("file-loaded", function()
     stop(true)
+    release_title()
     probe_file()
+end)
+
+-- The chat translator publishes a title of its own when it runs without
+-- subtitles. One way read, exactly like the sheet reads this script.
+mp.observe_property("user-data/chat_translate", "native", function()
+    refresh_title()
 end)
 
 mp.register_event("end-file", function() stop(true) end)

@@ -254,6 +254,11 @@ local tr_read      = 0
 local tr_pending   = ""
 local tr_by_n      = {}    -- line number -> English text
 local tr_count     = 0
+-- The video title in English, translated by the same helper. Only published
+-- here; translate_subs.lua is the one writer of force-media-title, so the two
+-- features cannot fight over the title.
+local tr_title_path = nil
+local tr_title_en   = nil
 -- Per line number: false = Japanese and still untranslated, true = translated.
 -- Keyed by line number rather than counted per record, because a backwards
 -- seek re-ingests the same lines and a plain counter would count them twice.
@@ -878,7 +883,8 @@ publish_translate = function()
     mp.set_property_native("user-data/chat_translate",
                            { on = tr_on, lines = tr_count, seen = line_no,
                              japanese = ja_total, english = ja_done,
-                             waiting = vis_wait })
+                             waiting = vis_wait,
+                             title_en = tr_title_en or "" })
 end
 
 stop_translate = function()
@@ -889,7 +895,9 @@ stop_translate = function()
     end
     if tr_path then os.remove(tr_path) end
     if pos_path then os.remove(pos_path) end
+    if tr_title_path then os.remove(tr_title_path) end
     tr_path, pos_path, tr_read, tr_pending = nil, nil, 0, ""
+    tr_title_path, tr_title_en = nil, nil
 end
 
 -- Translations are keyed by line number, so the reader is independent of the
@@ -902,6 +910,17 @@ tr_poll = function()
         if f then
             f:write(string.format("%.3f", mp.get_property_number("time-pos") or 0))
             f:close()
+        end
+    end
+    if tr_title_path and not tr_title_en then
+        local tf = io.open(tr_title_path, "r")
+        if tf then
+            local rec = utils.parse_json(tf:read("*a") or "")
+            tf:close()
+            if type(rec) == "table" and type(rec.en) == "string" and rec.en ~= "" then
+                tr_title_en = rec.en
+                publish_translate()
+            end
         end
     end
     if not tr_path then return end
@@ -952,10 +971,25 @@ tr_poll = function()
     if tr_count ~= before then publish_translate() end
 end
 
+-- The title to hand the helper, or nothing when the subtitle worker is
+-- already on it. That worker translates the title as well, so doing it here
+-- too would translate one line twice and, worse, load this helper's copy of
+-- the model before a single Japanese message has arrived. A failed worker is
+-- not a source, so that case falls through to here.
+local function source_title()
+    local t = mp.get_property_native("user-data/translate_subs")
+    if type(t) == "table" and type(t.state) == "string"
+       and t.state ~= "off" and t.state ~= "failed" then
+        return nil
+    end
+    return mp.get_property("media-title") or ""
+end
+
 local function start_translate()
     if tr_handle or not path then return end
     tr_path  = path .. ".tr"
     pos_path = path .. ".pos"
+    tr_title_path, tr_title_en = path .. ".title", nil
     os.remove(tr_path)
     tr_read, tr_pending, pos_next = 0, "", 0
     local exe  = tr_cmd()
@@ -967,6 +1001,13 @@ local function start_translate()
                    "--batch", tostring(TR_BATCH),
                    "--flush-after", tostring(TR_FLUSH),
                    "--lookahead", tostring(TR_LOOKAHEAD) }
+    local ja_title = source_title()
+    if ja_title and ja_title ~= "" then
+        args[#args + 1] = "--title"
+        args[#args + 1] = ja_title
+        args[#args + 1] = "--title-out"
+        args[#args + 1] = tr_title_path
+    end
     local gloss = mp.command_native({ "expand-path", TR_GLOSSARY })
     local info  = gloss and utils.file_info(gloss)
     if info and info.is_file then

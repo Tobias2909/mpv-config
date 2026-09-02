@@ -290,6 +290,10 @@ def main():
     ap.add_argument("--lookahead", type=float, default=120.0,
                     help="on a VOD, stop reading this far ahead of playback")
     ap.add_argument("--poll", type=float, default=0.2)
+    ap.add_argument("--title", default="",
+                    help="video title to translate once, before the chat")
+    ap.add_argument("--title-out", default="",
+                    help="file to write the translated title into")
     opts = ap.parse_args()
 
     stop = {"now": False}
@@ -306,6 +310,20 @@ def main():
             model["mt"] = W.Translator(W.model_dir_for(opts.mt_model), opts.device)
             log("model ready in %.1f s" % (time.time() - t0))
         return model["mt"](texts)
+
+    # The title before the chat, because it is on screen from the first
+    # frame while the first Japanese message may be minutes away. It is one
+    # line through the same model and the same glossary, and a title with no
+    # Japanese character in it never loads the model at all. The player reads
+    # the file and decides what to do with it; nothing here touches the video.
+    if opts.title and opts.title_out and has_ja(opts.title):
+        try:
+            en = W.translate_title(translate, opts.title, glossary)
+            if en:
+                W.store_title(opts.title_out, opts.title, en)
+                log("english title: %s" % en)
+        except Exception as e:
+            log("title translation failed: %r" % (e,))
 
     out = open(opts.out, "a", encoding="utf-8", buffering=1)
     batch = Batcher(out, translate, size=opts.batch, flush_after=opts.flush_after)
