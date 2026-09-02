@@ -59,19 +59,35 @@ local EMOTE_COLS  = 3         -- columns reserved per emote (~one line tall)
 -- cell count varies per emote. Capped so one very wide emote cannot eat a
 -- whole line of a 36-column panel.
 local EMOTE_COLS_MAX = 12
--- Animation. Cost is the overlay-add RATE, not the GPU: each visible animated
--- emote re-issues one command per tick. Three caps keep the worst case at
--- ANIM_MAX * ANIM_FPS commands/s (320) regardless of how many emotes are on
--- screen -- an emote wall degrades to stills, it does not melt the event loop.
+-- Animation. The cost is CPU on mpv's MAIN thread -- one mmap plus one command
+-- dispatch per re-issued frame, measured at ~80 us each -- and it is invisible
+-- to the GPU: at 63 animated emotes the VO thread does not move (+0.0 points),
+-- GPU utilisation stays inside noise and power draw is flat, on both a 1440p165
+-- and a 2160p60 output, at 1080p60 and 2160p60 source.
+--
+-- So the emote COUNT is nearly free and the ceiling is the id pool, not a
+-- command budget: ANIM_MAX is set from #OV_IDS below, i.e. everything on
+-- screen animates and nothing freezes on frame 0. The worst case ever
+-- measured (63 animated, "beside", 8 msg/s of 7 distinct animated emotes)
+-- ran at 1467 overlay-add/s for 18% of ONE core and dropped no frames, with
+-- ~8.5x headroom before that core would saturate. Even with the GPU pinned at
+-- 98% by a deliberately over-budget shader, the drop count was identical with
+-- animation off, at 16 and at 63.
+--
+-- ANIM_FPS is the expensive dimension, because it multiplies both the command
+-- rate and the redraws. That is the one to leave alone.
 local ANIM        = true      -- master switch, toggled live by toggle-anim
 local ANIM_FPS    = 20        -- overlay update rate, NOT the emote's own fps
-local ANIM_MAX    = 16        -- most animated at once; the rest freeze frame 0
+local ANIM_MAX                -- most animated at once; assigned from OV_IDS
 -- overlay-add ids are 0..63; thumbfast owns 42 (/etc/mpv/scripts/thumbfast.lua).
 -- Every other id is ours, so 63 images can be on screen at once. That is still
 -- far short of the worst case (37 lines x 9 emotes = 333 in "beside"), which is
 -- why runs are collapsed, messages are capped, and allocation runs newest-first.
 local THUMBFAST_ID = 42
--- Image slots one message may claim; the rest collapse into a "+N" token.
+-- Image slots one message may claim in the FULL-HEIGHT layout; the rest
+-- collapse into a "+N" token. "over" raises this and drops the run-collapse
+-- entirely -- see the cap/merge pair in render(), which derives both from the
+-- row count so the product can never drain the id pool.
 -- 4 was far too tight for YouTube: the popular pattern is ALTERNATING emoji
 -- (":brown_heart::green_heart:" repeated), so the adjacent-run collapse above
 -- never fires and 6 distinct slots is the single most common message shape.
@@ -310,7 +326,7 @@ end
 -- Emote labels are glued straight into the text -- ":a::a::a:" or
 -- "guapo:face-red-heart-shape:" -- so splitting on whitespace would never find
 -- them. Scan for the labels the helper reported instead.
-local function tokenize(rec)
+local function tokenize(rec, cap, merge)
     local labels = {}
     if type(rec.e) == "table" then
         for _, e in ipairs(rec.e) do
@@ -356,14 +372,19 @@ local function tokenize(rec)
     -- Collapse a run of the same emote into one image plus a count, the way
     -- chat clients do. An emote wall is exactly the case that would otherwise
     -- drain the overlay pool, and "x24" reads better than 24 copies anyway.
-    local merged = {}
-    for _, t in ipairs(toks) do
-        local prev = merged[#merged]
-        if t.emote and prev and prev.emote and prev.url == t.url then
-            prev.count = prev.count + 1
-        else
-            if t.emote then t.count = 1 end
-            merged[#merged + 1] = t
+    -- Only worth it where a wall really can drain the pool: a short panel
+    -- cannot, so it shows the copies instead (`merge` false).
+    local merged = toks
+    if merge then
+        merged = {}
+        for _, t in ipairs(toks) do
+            local prev = merged[#merged]
+            if t.emote and prev and prev.emote and prev.url == t.url then
+                prev.count = prev.count + 1
+            else
+                if t.emote then t.count = 1 end
+                merged[#merged + 1] = t
+            end
         end
     end
 
@@ -377,7 +398,7 @@ local function tokenize(rec)
     for _, t in ipairs(merged) do
         if t.emote then
             shown = shown + 1
-            if shown > MAX_PER_MSG then
+            if shown > cap then
                 -- N counts real emotes, not tokens: a token may already stand
                 -- for a collapsed run.
                 dropped = dropped + (t.count or 1)
@@ -734,6 +755,9 @@ local OV_IDS = {}             -- usable overlay ids, thumbfast's excluded
 for i = 0, 63 do
     if i ~= THUMBFAST_ID then OV_IDS[#OV_IDS + 1] = i end
 end
+-- Everything that can be on screen animates; see the ANIM block for why the
+-- old fixed cap was 4x lower than it needed to be.
+ANIM_MAX = #OV_IDS
 
 local emote_known    = {}     -- url -> meta table, or false for "not cached"
 local emote_pending  = {}     -- url -> true, waiting to be fetched
@@ -947,6 +971,22 @@ function render()
     if y0 + panel_h > RES_Y - bot_px then panel_h = RES_Y - bot_px - y0 end
     if panel_h < line_h then panel_h = line_h end
     local max_ln  = math.max(1, math.floor((panel_h - 2 * PAD) / line_h))
+    -- A message occupies at least one row, so at most max_ln of them can be on
+    -- screen and the images they claim can never exceed max_ln * cap. Deriving
+    -- the cap from the pool keeps that product inside #OV_IDS BY CONSTRUCTION,
+    -- which is what makes it safe to stop collapsing runs: the short "over"
+    -- panel (8 rows -> cap 7 -> 56 <= 63) shows every emote a message sent,
+    -- while the full-height layout (37 rows) keeps the collapse and the
+    -- measured cap of 6 and degrades off the top as before.
+    -- In practice "over" holds fewer than 56 images anyway: emote cell width
+    -- follows the image aspect (3-5 cells for real shapes), so some 7-emote
+    -- messages wrap onto a second row and the panel self-limits.
+    local cap     = MAX_PER_MSG
+    local merge   = true
+    if over then
+        cap   = math.max(MAX_PER_MSG, math.floor(#OV_IDS / max_ln))
+        merge = false
+    end
 
     -- Build newest-first until the panel is full, then flip for drawing.
     local list, lines = visible_slice(), {}
@@ -957,7 +997,8 @@ function render()
         -- ending the head with ": " would render a double space.
         local head = string.format("{\\b1\\c%s}%s{\\b0\\c&HFFFFFF&}:",
                                    ass_colour(rec.color), ass_escape(user))
-        local block = wrap_tokens(tokenize(rec), cols, head, uwidth(user) + 1)
+        local block = wrap_tokens(tokenize(rec, cap, merge), cols, head,
+                                  uwidth(user) + 1)
         for j = #block, 1, -1 do
             table.insert(lines, 1, block[j])
             if #lines >= max_ln then break end

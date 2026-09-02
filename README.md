@@ -156,10 +156,12 @@ measure what it costs.
 Two limits are worth knowing about. mpv has exactly 64 overlay slots, numbered 0 to 63, and
 one of them belongs to the thumbnail preview, so **63 emote images can be on screen at once**.
 A busy panel wants far more than that, roughly 37 lines of nine emotes each in the beside
-layout, which is why repeats of one emote are collapsed and slots are handed to the newest
+layout, which is why that layout collapses repeats of one emote and hands slots to the newest
 messages first. An emote wall then runs out of images at the top of the panel rather than at
-the freshest line. On top of that **one message may claim six image slots**, and anything past
-that collapses into a single token that reads plus and a number.
+the freshest line. How many image slots **one message may claim follows the height of the
+panel**, so the over layout, being eight lines tall, allows seven and draws repeats as
+separate images, while the taller beside layout keeps six and the collapsing. Anything past
+the cap becomes a single token that reads plus and a number.
 
 The chat font is a monospace face that covers Latin and
 Japanese in one file, because emote images are positioned by counting character cells, and the
