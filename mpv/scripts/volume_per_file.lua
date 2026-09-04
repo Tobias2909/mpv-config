@@ -1,7 +1,7 @@
 -- Per-video volume memory
 --
 -- WHY THIS EXISTS. mpv already stores `volume` in its watch_later file and
--- restores it, so this looks redundant -- it is not. Two measured gaps:
+-- restores it, so this looks redundant -- it is not. Three measured gaps:
 --
 --   1. A file that reaches its END stores NOTHING. mpv only writes a resume
 --      file for the file that is playing when you quit; a finished file is
@@ -12,6 +12,13 @@
 --      Measured twice: a two-entry playlist advancing on EOF started the
 --      second file at the first file's 33, and a normal-mode browser handoff
 --      (`loadfile B replace` mid-play) started B at A's 55.
+--   3. A FRESH player has nothing to inherit. An unseen video takes over
+--      whatever is set, which mid-session is the level last listened at, but
+--      at startup is mpv's built-in 100 -- louder than anything actually
+--      used here. So switching videos inside one session was already right
+--      while the first video of a session was loud every time. The level last
+--      written is therefore kept globally as well and seeded at startup,
+--      which makes the two cases behave the same way.
 --
 -- Both hit outside queue mode too -- the F9 loop only makes it constant enough
 -- to notice -- which is why this runs for every file rather than reading the
@@ -24,7 +31,10 @@
 --
 -- Store: one file per video under $XDG_STATE_HOME/mpv/volume-per-file/,
 -- holding the bare number. Readable name + djb2 suffix so entries can be
--- inspected and deleted by hand. Delete a file -> that video forgets.
+-- inspected and deleted by hand. Delete a file -> that video forgets. The
+-- level last written lives beside them in `last-volume`; a key file always
+-- ends in `_` plus 8 hex digits and the sanitiser turns every `-` into `_`,
+-- so that name cannot collide with a video's.
 
 local mp  = require "mp"
 local msg = require "mp.msg"
@@ -36,6 +46,8 @@ local DEBOUNCE = 1.0
 local DIR = (os.getenv("XDG_STATE_HOME")
              or ((os.getenv("HOME") or ".") .. "/.local/state"))
             .. "/mpv/volume-per-file"
+
+local LAST_FILE = DIR .. "/last-volume"
 
 local key      = nil    -- identity of the file currently loaded, nil when idle
 local pending  = nil    -- volume waiting to be written under `key`
@@ -103,17 +115,16 @@ local function identity()
     return path
 end
 
-local function load_vol(k)
-    local f = io.open(key_file(k), "r")
+local function read_number(path)
+    local f = io.open(path, "r")
     if not f then return nil end
     local v = tonumber(f:read("*l") or "")
     f:close()
     return v
 end
 
-local function store_vol(k, v)
-    local path = key_file(k)
-    local tmp  = path .. ".tmp"
+local function write_number(path, v)
+    local tmp = path .. ".tmp"
     -- Rename over the old entry so a reader never sees a half-written number,
     -- and so two mpv instances racing on the same video cannot merge digits.
     local f = io.open(tmp, "w")
@@ -131,10 +142,27 @@ local function store_vol(k, v)
     os.rename(tmp, path)
 end
 
+local function load_vol(k)  return read_number(key_file(k)) end
+local function store_vol(k, v)  write_number(key_file(k), v) end
+
+-- Clamped against the live ceiling on the way in: --volume-max can be lowered
+-- between sessions, and setting a volume above it fails outright instead of
+-- saturating.
+local function usable(v)
+    if type(v) ~= "number" then return nil end
+    local max = mp.get_property_number("volume-max") or 100
+    if v > max then v = max end
+    if v < 0 then v = 0 end
+    return v
+end
+
 local function flush()
     if timer then timer:kill(); timer = nil end
     if key and pending then
         store_vol(key, pending)
+        -- Same number twice on purpose: per video for its own restore, and
+        -- globally as the level a never-seen video should start at.
+        write_number(LAST_FILE, pending)
         pending = nil
     end
 end
@@ -160,25 +188,46 @@ mp.register_event("file-loaded", function()
     key = identity()
     if not key then return end
 
-    local saved = load_vol(key)
+    local saved = usable(load_vol(key))
     local cur   = mp.get_property_number("volume")
     if saved then
-        -- Clamping matters: --volume-max can be lowered between sessions, and
-        -- setting a volume above it fails outright instead of saturating.
-        local max = mp.get_property_number("volume-max") or 100
-        if saved > max then saved = max end
-        if saved < 0 then saved = 0 end
         if cur and math.abs(cur - saved) > 0.01 then
             mp.set_property_number("volume", saved)
         end
     elseif cur then
         -- Unknown video: keep whatever is set and adopt it as this video's
-        -- value. The last level used is the best available guess for an unseen
-        -- video, and after one play every video carries its own number.
-        store_vol(key, cur)
+        -- value. The level last listened at is the best available guess for an
+        -- unseen video, and after one play every video carries its own number.
+        -- Through the same writer as a real change, so this level also becomes
+        -- the one the next fresh player seeds from -- otherwise a session that
+        -- only ever played unseen videos would leave nothing behind.
+        pending = cur
+        flush()
     end
 end)
 
 -- EOF is the case mpv itself drops on the floor, so this is the important one.
 mp.register_event("end-file", flush)
 mp.register_event("shutdown", flush)
+
+-- Seed the level a fresh player starts at, before any file is loaded, so the
+-- "unknown video inherits what is set" branch above inherits the level last
+-- listened at rather than mpv's built-in 100. A known video still overrides
+-- this with its own value at file-loaded, and nothing is written here: the
+-- observer ignores a change while no file is loaded.
+--
+-- An explicit `--volume=` wins. `set-from-commandline` is what separates it
+-- from the same option in mpv.conf, which must not block the seed.
+local function seed()
+    if mp.get_property_bool("option-info/volume/set-from-commandline") then
+        return
+    end
+    local last = usable(read_number(LAST_FILE))
+    if not last then return end
+    local cur = mp.get_property_number("volume")
+    if cur and math.abs(cur - last) > 0.01 then
+        mp.set_property_number("volume", last)
+    end
+end
+
+seed()
