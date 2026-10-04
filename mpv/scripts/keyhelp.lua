@@ -257,7 +257,7 @@ local BUILTIN = {
     { "?",            "FULL binding list (built-in stats script)" },
     { "right-click",  "Pause / unpause (OSC has no play button)" },
     { "wheel",        "Volume" },
-    { "b",            "SponsorBlock skipping on/off" },
+    { "b",            "Toggle SponsorBlock auto skip (per video)" },
     { "< / >",        "Previous / next playlist entry" },
     { "LEFT/RIGHT",   "Seek -/+ 5 s" },
     { "m",            "Mute" },

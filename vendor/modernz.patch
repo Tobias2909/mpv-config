@@ -1,6 +1,76 @@
 --- a/modernz.lua
 +++ b/modernz.lua
-@@ -2539,11 +2539,9 @@
+@@ -628,6 +628,7 @@
+     keeponpause_active = false,             -- keeponpause bottombar active state
+     duration = nil,                         -- current file duration
+     chapter_list = {},                      -- sorted by time
++    sb_segments = {},                       -- local patch: SponsorBlock segments, sorted by start
+     chapter = -1,                           -- current chapter index
+     visibility_modes = {},                  -- visibility_modes to cycle through
+     eof_reached = false,
+@@ -1449,6 +1450,41 @@
+     elem_ass:rect_cw(ax, slider_lo.gap, bx, elem_geo.h - slider_lo.gap)
+ end
+ 
++-- local patch: SponsorBlock segments from scripts/sponsorblock.lua, all in one
++-- colour, named in the seek bar tooltip and used as right click snap points
++local SB_COLOR = "#B00020"
++local SB_ALPHA = 0        -- 0 opaque, 255 invisible
++local SB_HEIGHT = 1.0     -- share of the bar height, centred
++
++local function get_sponsorblock_segment(possec)
++    for _, s in ipairs(state.sb_segments) do
++        if possec >= s.start and possec < s.stop then return s end
++    end
++end
++
++local function draw_sponsorblock_ranges(element, elem_ass)
++    if element.name ~= "seekbar" or not state.duration or state.duration <= 0 then return end
++    if #state.sb_segments == 0 then return end
++    local slider_lo = element.layout.slider
++    local elem_geo = element.layout.geometry
++    local full = elem_geo.h - 2 * slider_lo.gap
++    local inset = slider_lo.gap + full * (1 - SB_HEIGHT) / 2
++    elem_ass:draw_stop()
++    elem_ass:merge(element.style_ass)
++    ass_append_alpha(elem_ass, element.layout.alpha, SB_ALPHA)
++    elem_ass:append("{\\blur0\\bord0\\1c&H" .. osc_color_convert(SB_COLOR) .. "&}")
++    elem_ass:merge(element.static_ass)
++    for _, s in ipairs(state.sb_segments) do
++        -- a segment touching either end of the video covers the bar's rounded cap too
++        local at_start, at_end = s.start <= 0, s.stop >= state.duration
++        local ax = at_start and 0 or get_slider_ele_pos_for(element, s.start / state.duration * 100)
++        local bx = at_end and elem_geo.w or get_slider_ele_pos_for(element, s.stop / state.duration * 100)
++        bx = math.max(bx, ax + 2)   -- keep a short segment visible on a long video
++        elem_ass:round_rect_cw(ax, inset, bx, elem_geo.h - inset,
++            at_start and slider_lo.radius or 0, at_end and slider_lo.radius or 0)
++    end
++end
++
+ local function draw_seekbar_nibbles(element, elem_ass)
+     local slider_lo = element.layout.slider
+     local elem_geo = element.layout.geometry
+@@ -1650,6 +1686,7 @@
+                 draw_seekbar_progress(element, elem_ass)
+                 draw_seekbar_ranges(element, elem_ass, handle_x, handle_radius)
+                 draw_ab_loop_range(element, elem_ass)
++                draw_sponsorblock_ranges(element, elem_ass) -- local patch
+                 draw_seekbar_handle(element, elem_ass, handle_x, handle_radius, anim_override, is_active) -- draw handle on top of progress
+ 
+                 elem_ass:draw_stop()
+@@ -1665,6 +1702,11 @@
+                     if mouse_hit(element) or force_seek_tooltip then
+                         local sliderpos = get_slider_value(element)
+                         local tooltiplabel = element.slider.tooltipF(sliderpos)
++                        -- local patch: name the SponsorBlock segment under the mouse
++                        if element.name == "seekbar" and state.duration and state.duration > 0 then
++                            local seg = get_sponsorblock_segment(sliderpos * state.duration / 100)
++                            if seg then tooltiplabel = tooltiplabel .. "  " .. seg.label end
++                        end
+                         local an = slider_lo.tooltip_an
+                         local ty
+                         if an == 2 then
+@@ -2539,11 +2581,9 @@
          end
      end
  
@@ -15,3 +85,41 @@
  
      local pl_count = state.playlist_count
      local pl_pos = state.playlist_pos_1
+@@ -3560,7 +3600,24 @@
+             end
+         end
+ 
+-        if chapter then
++        -- local patch: the start and end of every SponsorBlock segment are
++        -- snap points too, and the nearest of all of them wins
++        local snap_time
++        if state.duration and state.duration > 0 then
++            for _, s in ipairs(state.sb_segments) do
++                for _, t in ipairs({ s.start, math.min(s.stop, state.duration) }) do
++                    local d = math.abs(pos - t / state.duration * 100)
++                    if d < diff then
++                        diff = d
++                        snap_time = t
++                    end
++                end
++            end
++        end
++
++        if snap_time then
++            mp.commandv("seek", snap_time, "absolute+exact")
++        elseif chapter then
+             mp.set_property("chapter", chapter - 1)
+         end
+     end
+@@ -4154,6 +4211,11 @@
+     table.sort(state.chapter_list, function(a, b) return a.time < b.time end)
+     request_init()
+ end)
++-- local patch: SponsorBlock segments, see draw_sponsorblock_ranges()
++mp.observe_property("user-data/sponsorblock/segments", "native", function (_, value)
++    state.sb_segments = type(value) == "table" and value or {}
++    request_tick()
++end)
+ observe_cached("duration", function ()
+     if user_opts.automatickeyframemode then
+         user_opts.seekbarkeyframes = (state.duration or 0) > user_opts.automatickeyframelimit

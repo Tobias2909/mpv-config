@@ -31,7 +31,7 @@ files. Three things have to be downloaded once before this config works complete
 mpv/
   mpv.conf            renderer, shader, cache, auth, window
   input.conf          every key binding
-  scripts/            8 Lua scripts
+  scripts/            9 Lua scripts
   script-opts/        my ModernZ and thumbfast settings
   shaders/            EMPTY, drop the ArtCNN GLSL files in here
   fonts/              EMPTY, drop modernz-icons.ttf in here
@@ -50,9 +50,10 @@ docs/screenshots/     the pictures in this file
 * **ModernZ** from https://github.com/Samillion/ModernZ, which replaces mpv's own on screen
   controller. Copy its `modernz.lua` into `mpv/scripts/`, its icon font and its
   `modernz-locale.json` into `mpv/fonts/` and `mpv/script-opts/`, then apply
-  `vendor/modernz.patch`, which is five lines and takes the play and pause button out of
-  the compact layout, since a right click already pauses. The patch is written against version
-  0.3.3 and you can simply skip it if you want the button.
+  `vendor/modernz.patch`. It takes the play and pause button out of the compact layout, since
+  a right click already pauses, and teaches the seek bar about SponsorBlock segments as
+  described further down. The patch is written against version 0.3.3. Without it you keep the
+  button and lose the segment marks.
   ModernZ has to live in the user config folder rather than being installed as a package,
   because mpv loads a script of the same name from both places and you end up with two
   controllers stacked on top of each other.
@@ -64,13 +65,12 @@ Programs that have to be present are `mpv`, `yt-dlp`, `socat`, `jq`, `python3`, 
 emote decoding, `streamlink` with the `streamlink-ttvlol` plugin for Twitch, and
 `ff2mpv-rust` for the browser handoff.
 
-Two more mpv scripts are involved that are not mine and are not here, because both are
-installed system wide by their own packages. **thumbfast** draws the preview thumbnail when
-you hover the seek bar, and `mpv/script-opts/thumbfast.conf` is my override of its settings,
-which turns previews on for network streams and starts the thumbnailer early so the first
-hover is not empty. **sponsorblock_minimal** skips sponsor segments in YouTube videos and
-answers the **b** key. Nothing breaks without them. You lose the previews and the skipping,
-and the overlay slot that thumbfast reserves becomes one more emote.
+One more mpv script is involved that is not mine and is not here, because it is installed
+system wide by its own package. **thumbfast** draws the preview thumbnail when you hover the
+seek bar, and `mpv/script-opts/thumbfast.conf` is my override of its settings, which turns
+previews on for network streams and starts the thumbnailer early so the first hover is not
+empty. Nothing breaks without it. You lose the previews, and the overlay slot that thumbfast
+reserves becomes one more emote.
 
 ## Sending a video from the browser
 
@@ -329,7 +329,7 @@ The right hand column of the sheet is mpv's own keys rather than anything this c
 kept there so that one screen answers every question. It covers the seek keys, mute,
 fullscreen, quitting with and without saving the position, the playlist keys, volume on the
 mouse wheel, pause on a right click, since the controller has no pause button any more, and
-**b** for sponsor segment skipping.
+**b** for turning SponsorBlock skipping off for the video that is playing.
 
 ## Queue mode
 
@@ -363,6 +363,24 @@ that video then forgets. Volume is removed from mpv's own resume options so that
 writer instead of two, while values already written by the old behaviour are still picked up
 once as a free migration. Writes are coalesced, because one scroll of the wheel produces a
 property event per tick.
+
+## SponsorBlock
+
+`scripts/sponsorblock.lua` asks the SponsorBlock database for the segments of a YouTube video
+as soon as the file starts, which is usually answered before the video itself has loaded.
+Sponsor segments and intros are skipped on their own. Self promotion, interaction reminders,
+outros, previews and filler are only marked, as dark red stretches on the seek bar, and
+hovering one names its category next to the time. A right click on the seek bar jumps to the
+nearest chapter start or segment edge, which is how a marked segment gets skipped by hand. An
+intro that runs straight into a sponsor is skipped in one seek instead of two.
+
+**b** turns the automatic skipping off for the video that is playing, for the rare entry whose
+intro reaches too far. The next video starts with it on again.
+
+The database is asked by the first four characters of the SHA256 hash of the video id, the
+same way the browser extension does it, and the answer is filtered locally, so the server
+never learns which video is playing. What the script finds is published in
+`user-data/sponsorblock/segments`, which is where the patched ModernZ reads it from.
 
 ## Smaller scripts
 
@@ -482,6 +500,8 @@ If you are here for parts rather than the whole thing, these work anywhere with 
 These are useful as a pattern but are tied to how I have things set up.
 
 * `scripts/keyhelp.lua`, which adapts to your `input.conf` on its own but names my shaders
+* `scripts/sponsorblock.lua`, which skips on its own but needs the patched ModernZ to draw
+  anything
 * `bin/mpv-ff2mpv-single.sh` and `bin/mpv-queue-toggle` with `scripts/queue_mode.lua`
 
 And these are measurements of my hardware, not settings.
@@ -494,4 +514,5 @@ And these are measurements of my hardware, not settings.
 ArtCNN by Joao Chrisostomo and Kacper Michajłow, MIT licensed. ModernZ by Samillion, which
 descends from mpv's own on screen controller and is LGPL 2.1 licensed, included here only as a
 patch against its source. ff2mpv by William Woodruff. streamlink and the TTV LOL plugin.
-`yt-dlp`. Everything written by me in this repository is MIT licensed, see `LICENSE`.
+`yt-dlp`. Segment data from the SponsorBlock project by Ajay Ramachandran. Everything written by
+me in this repository is MIT licensed, see `LICENSE`.
