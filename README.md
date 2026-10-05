@@ -135,7 +135,14 @@ output. **F10** cycles through three states, off, beside and over.
 
 * **beside** shrinks the picture into the left part of the window and gives chat its own
   column, so nothing is covered.
-* **over** leaves the picture at full size and puts a chat panel over the top right corner.
+* **over** leaves the picture at full size and puts chat in a box over it, at the top right
+  at first. Drag its head to move it and a corner to size it, and it keeps that place and size
+  from then on. The wheel over the head makes the backdrop darker or lighter, and a right click
+  on the head locks the box so it can no longer be moved and stays plain when the mouse moves.
+
+The wheel over the chat scrolls back through it in both layouts. While you read older lines the
+chat holds still and a button counts the new ones, and scrolling back down or a click on that
+button follows the chat again.
 
 ![Chat over the video](docs/screenshots/chat_over.jpg)
 

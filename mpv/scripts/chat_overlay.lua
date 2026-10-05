@@ -7,7 +7,10 @@
 --
 -- F10 cycles: off -> beside -> over -> off
 --   beside : video shrinks into the left 3/4, chat gets its own column
---   over   : video stays full size, chat sits over the top-right corner
+--   over   : video stays full size, chat sits in a box over it, carried by
+--            its head, sized by its corners, wheel over the head = backdrop
+--
+-- The wheel over the chat scrolls back through it, in either layout.
 --
 -- Emote images are deliberately NOT handled yet; emote names render as text.
 
@@ -112,7 +115,6 @@ local PAD         = 12
 local MAX_KEEP    = 500000    -- already-shown messages kept behind the cursor
 local CHUNK       = 262144    -- bytes read per pass
 local MAX_CHUNKS  = 20        -- passes per poll, so a big VOD can't stall mpv
-local MAX_SHOW    = 60        -- messages considered for one redraw
 local CHAT_DELAY  = 0         -- seconds to hold chat back, relative to video
 -- YouTube delivers live chat in ~10 s fragments (measured: 84 messages on only
 -- 7 distinct arrival timestamps, fragments 9.9-10.2 s apart), so every message
@@ -162,6 +164,54 @@ local LOOKAHEAD   = 21600     -- stop reading this far (s) ahead of playback
 local POLL        = 0.05      -- seconds between file polls == chat refresh rate
 local FADE_STEPS  = 8
 local FADE_TIME   = 0.20      -- seconds for the fade in/out
+
+-- The "over" box: carried by its head, sized by its corners, and kept in
+-- shares of the screen, so a screen of another size puts it in the same place. One table, because LuaJIT allows a
+-- chunk 200 locals and a function 60 upvalues.
+local UI = {
+    -- 4/6 in from the left, 1/6 wide, 1/4 high, which is 8 rows.
+    default   = { x = 4 / 6, y = 0.02, w = 1 / 6, h = 1 / 4 },
+    min_w     = 0.08,      -- least size, shares of the screen
+    min_h     = 0.12,
+    -- Sizes in the virtual canvas (RES_X x RES_Y below).
+    head_h    = 26,        -- the strip the box is carried by
+    head_font = "Noto Sans",
+    head_fs   = 16,
+    close_fs  = 17,
+    close_w   = 30,        -- the end of the head that closes instead
+    body_l    = 10, body_r = 6, body_b = 8,
+    radius    = 5,
+    grip      = 8,         -- the square drawn in each corner
+    grip_in   = 14,        -- how far a corner can be taken, inward
+    grip_out  = 5,         -- and outward
+    pill_h    = 24,
+    pill_fs   = 15,
+    accent    = "#7C5CFF", -- border, corners and pill
+    pill_ink  = "#F2F4F8", -- and its badge text
+    -- The black behind the chat, changed by the wheel over the head. The
+    -- text gets an outline back only as the backdrop gets too thin to read on.
+    backdrop  = 0.6,
+    backdrop_step = 0.1,
+    nap       = 2.6,       -- seconds of stillness before the chrome goes
+    fade      = 0.18,
+    note_time = 1.2,       -- how long the head names the backdrop's share
+    -- The wheel glides, three rows a notch, 160 ms with an OutCubic ease,
+    -- so the eye keeps its place.
+    scroll_rows = 3,
+    glide_time  = 0.16,
+    frame       = 1 / 60,  -- step of the glide and the chrome fade
+    -- Lines that came in while scrolled up glide in on the way back down;
+    -- more messages than this and the way back is a jump.
+    rejoin_max  = 300,
+    corners = {
+        { name = "grip_tl", ax = -1, ay = -1 }, { name = "grip_tr", ax = 1, ay = -1 },
+        { name = "grip_bl", ax = -1, ay = 1 },  { name = "grip_br", ax = 1, ay = 1 },
+    },
+    section = "chat-box",  -- the input section over the box
+    -- and one over its head alone, for the right click that locks it, so a
+    -- right click anywhere else still reaches mpv
+    section_head = "chat-box-head",
+}
 
 -- Japanese chat -> English, by ~/.local/bin/mpv-chat-translate. It follows the
 -- same JSONL the panel reads and appends {"n", "en"} lines to a sidecar file,
@@ -287,6 +337,36 @@ local pos_next     = 0
 local alpha        = 255   -- 255 = invisible, 0 = opaque
 local target_alpha = 255
 local dirty        = true
+
+-- The box and the hand on it.
+local box          = { x = UI.default.x, y = UI.default.y,
+                       w = UI.default.w, h = UI.default.h }
+local backdrop     = UI.backdrop
+local chrome       = 0     -- how far border, head and corners are shown, 0..1
+local chrome_to    = 0
+local chrome_timer = nil
+local nap_timer    = nil
+local note         = nil   -- what the head says instead of "Chat" for a moment
+local note_timer   = nil
+-- Locked by a right click on the head: no chrome, no carrying or sizing.
+-- The wheel still scrolls the chat and still sets the backdrop.
+local locked       = false
+local hand         = nil   -- the head or corner being held
+local pressed      = nil   -- the close mark or the pill, pressed, not let go yet
+local hover        = nil   -- the part of the box under the pointer
+local mouse_x, mouse_y = 0, 0
+local osd_sx, osd_sy, osd_w, osd_h = nil, nil, nil, nil
+local pill_rect    = nil   -- where render() put the "N new" pill, virtual px
+local area_sync    = nil   -- assigned with the input handling
+local flush_box    = nil   -- likewise
+-- Scrolling. `scroll` is how far (virtual px) the newest drawn line sits
+-- below the bottom edge; `held` is the message kept as the newest drawn one
+-- while scrolled up, nil while following the chat.
+local scroll       = 0
+local scroll_most  = math.huge  -- highest `scroll` with lines still above
+local held         = nil
+local glide        = nil
+local glide_timer  = nil
 
 ------------------------------------------------------------------- helpers
 
@@ -641,6 +721,7 @@ local function stop_helper()
     by_n, tr_by_n, line_no, tr_count = {}, {}, 0, 0
     ja_state, ja_total, ja_done = {}, 0, 0
     vis_wait = 0
+    held, scroll, glide = nil, 0, nil
     -- Publish only now: stop_translate() above runs before this reset, so
     -- publishing there would republish the counts of the file being left.
     if publish_translate then publish_translate() end
@@ -880,7 +961,7 @@ local function start_helper()
         poll()
         tr_poll()
         pump_fetch()
-        if dirty then render() end
+        if dirty and not hand then render() end
     end)
 end
 
@@ -1235,12 +1316,13 @@ end
 -- handful of overlay commands this actually needs.
 local function anim_tick()
     for id, sl in pairs(anim_slots) do
-        local off = frame_offset(sl.fps, sl.n, sl.frame_bytes)
+        -- `crop` skips the rows cut off at the top edge, `ch` is what is left.
+        local off = frame_offset(sl.fps, sl.n, sl.frame_bytes) + sl.crop
         local sig = table.concat({ sl.path, sl.px, sl.py, sl.dw, sl.dh, off }, "|")
         if ov_active[id] ~= sig then
             mp.command_native_async({
                 "overlay-add", id, sl.px, sl.py,
-                sl.path, off, "bgra", sl.w, sl.h, sl.w * 4, sl.dw, sl.dh,
+                sl.path, off, "bgra", sl.w, sl.ch, sl.w * 4, sl.dw, sl.dh,
             }, function() end)
             ov_active[id] = sig
         end
@@ -1265,8 +1347,8 @@ local function clear_overlays()
     anim_sync()
 end
 
--- Which slice of `msgs` is due at the current playback position.
-local function visible_slice()
+-- Move `cursor` to the newest message due at the current playback position.
+local function advance()
     local now = mp.get_property_number("time-pos") or 0
     -- show_at ascends, so a linear cursor walk suffices going forwards; a
     -- backwards seek rewinds it.
@@ -1282,14 +1364,225 @@ local function visible_slice()
     if excess > 0 then
         for _ = 1, excess do table.remove(msgs, 1) end
         cursor = cursor - excess
+        -- The held view counts from the same start, so it moves with it.
+        if held then
+            held = held - excess
+            if held < 1 then held = nil end
+        end
     end
-    -- Observable state: `shown` only advances while playback advances, so a
-    -- frozen counter during pause is the proof that sync works.
-    local out = {}
-    for i = math.max(1, cursor - MAX_SHOW + 1), cursor do
-        out[#out + 1] = msgs[i]
+end
+
+-- 0..1 opacity -> ASS alpha byte (0 = opaque).
+local function ab(opacity)
+    if opacity < 0 then opacity = 0 elseif opacity > 1 then opacity = 1 end
+    return 255 - math.floor(opacity * 255 + 0.5)
+end
+
+-- A rounded rectangle as an ASS drawing in absolute virtual px, on whole
+-- units. The corners are cubic quarter circles (control points 0.4477 r in).
+local function rrect(x, y, w, h, r)
+    x, y = math.floor(x + 0.5), math.floor(y + 0.5)
+    w, h = math.floor(w + 0.5), math.floor(h + 0.5)
+    local x1, y1 = x + w, y + h
+    r = math.floor(math.min(r, w / 2, h / 2))
+    if r <= 0 then
+        return string.format("m %d %d l %d %d %d %d %d %d",
+                             x, y, x1, y, x1, y1, x, y1)
     end
+    local k = math.floor(r * 0.4477 + 0.5)
+    return string.format(
+        "m %d %d l %d %d b %d %d %d %d %d %d l %d %d b %d %d %d %d %d %d " ..
+        "l %d %d b %d %d %d %d %d %d l %d %d b %d %d %d %d %d %d",
+        x + r, y,   x1 - r, y,   x1 - k, y,   x1, y + k,   x1, y + r,
+        x1, y1 - r,   x1, y1 - k,   x1 - k, y1,   x1 - r, y1,
+        x + r, y1,   x + k, y1,   x, y1 - k,   x, y1 - r,
+        x, y + r,   x, y + k,   x + k, y,   x + r, y)
+end
+
+-- Where chat goes for a layout, in the virtual canvas: the box or column
+-- (bx, by, bw, bh), the band its lines may use (top, bot), where they start
+-- and how many cells they wrap at.
+local function geometry(layout)
+    local g = {}
+    local char_w = FONT_SIZE * CHAR_W_RATIO
+    if layout == "over" then
+        g.bx, g.by = box.x * RES_X, box.y * RES_Y
+        g.bw, g.bh = box.w * RES_X, box.h * RES_Y
+        g.text_x = g.bx + UI.body_l
+        g.text_w = g.bw - UI.body_l - UI.body_r
+        -- The box may sit under the OSC; its lines never do.
+        g.top = math.max(g.by + UI.head_h, osc_t * RES_Y)
+        g.bot = math.min(g.by + g.bh - UI.body_b, RES_Y - osc_b * RES_Y)
+    else
+        -- "beside" is flush right, the video is margined out of its way.
+        local col_w = RES_X * COL_BESIDE
+        g.bx, g.by, g.bw, g.bh = RES_X - col_w, 0, col_w, RES_Y
+        g.text_x = g.bx + PAD
+        g.text_w = col_w - 2 * PAD
+        g.top = 2 * PAD + osc_t * RES_Y
+        g.bot = RES_Y - 2 * PAD - osc_b * RES_Y
+    end
+    g.cols = math.max(8, math.floor(g.text_w / char_w))
+    -- A message occupies at least one row, so the images on screen can never
+    -- exceed rows * cap. In "over" the cap is derived from the pool, so the
+    -- default box (8 rows -> cap 7 -> 56 <= 63) shows every emote a message
+    -- sent and only the rest becomes "+N"; runs are never collapsed there.
+    -- A box sized taller keeps the cap of 6 and simply runs out of images,
+    -- which drop off the TOP. "beside" (37 rows) keeps the run
+    -- collapse and the measured cap of 6.
+    g.rows = math.max(1, math.floor((g.bot - g.top) / (FONT_SIZE * LINE_SPACE)))
+    if layout == "over" then
+        g.cap, g.merge = math.max(MAX_PER_MSG, math.floor(#OV_IDS / g.rows)), false
+    else
+        g.cap, g.merge = MAX_PER_MSG, true
+    end
+    return g
+end
+
+-- A name's colour, lifted until it reads on the dark behind it, the way
+-- Twitch's own dark mode does: dark blue on black is hard to make out.
+-- Lightness goes up in HSL steps of 0.06 until the relative luminance
+-- reaches 0.2, hue and saturation kept. Memoised per colour.
+local lifted = {}
+local function name_colour(hex)
+    if type(hex) ~= "string" then return hex end
+    if lifted[hex] then return lifted[hex] end
+    local r, g, b = hex:match("^#(%x%x)(%x%x)(%x%x)$")
+    if not r then return hex end
+    r, g, b = tonumber(r, 16) / 255, tonumber(g, 16) / 255, tonumber(b, 16) / 255
+    local function lum(cr, cg, cb)
+        local function part(v)
+            return v <= 0.03928 and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+        end
+        return 0.2126 * part(cr) + 0.7152 * part(cg) + 0.0722 * part(cb)
+    end
+    local function rgb(h, s, l)
+        if s == 0 then return l, l, l end
+        local q = l < 0.5 and l * (1 + s) or l + s - l * s
+        local p = 2 * l - q
+        local function ch(t)
+            t = t % 1
+            if t < 1 / 6 then return p + (q - p) * 6 * t end
+            if t < 1 / 2 then return q end
+            if t < 2 / 3 then return p + (q - p) * (2 / 3 - t) * 6 end
+            return p
+        end
+        return ch(h + 1 / 3), ch(h), ch(h - 1 / 3)
+    end
+    local out = hex
+    if lum(r, g, b) < 0.2 then
+        local mx, mn = math.max(r, g, b), math.min(r, g, b)
+        local l = (mx + mn) / 2
+        local h, s = 0, 0
+        if mx ~= mn then
+            local d = mx - mn
+            s = l > 0.5 and d / (2 - mx - mn) or d / (mx + mn)
+            if mx == r then h = (g - b) / d + (g < b and 6 or 0)
+            elseif mx == g then h = (b - r) / d + 2
+            else h = (r - g) / d + 4 end
+            h = h / 6
+        end
+        for _ = 1, 12 do
+            l = math.min(1, l + 0.06)
+            r, g, b = rgb(h, s, l)
+            if lum(r, g, b) >= 0.2 then break end
+        end
+        out = string.format("#%02X%02X%02X", math.floor(r * 255 + 0.5),
+                            math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+    end
+    lifted[hex] = out
     return out
+end
+
+-- A message's rows at this width. Kept on the record, because scrolling
+-- redraws every frame of a glide and far back that is hundreds of messages.
+-- The key holds everything the wrap depends on, including each emote's cell
+-- count, which changes once its image is cached and its shape known.
+local function rows_of(rec, cols, cap, merge)
+    local key = { cols, cap, merge and 1 or 0, (tr_on and rec.en) or "" }
+    if type(rec.e) == "table" then
+        for _, e in ipairs(rec.e) do
+            if type(e) == "table" and type(e.url) == "string" then
+                key[#key + 1] = emote_cols(e.url)
+            end
+        end
+    end
+    key = table.concat(key, "|")
+    local c = rec.wrap
+    if c and c.key == key then return c.rows end
+    local user = rec.user or "?"
+    -- No trailing space: wrap_tokens inserts the separator itself, so
+    -- ending the head with ": " would render a double space.
+    local head = string.format("{\\b1\\c%s}%s{\\b0\\c&HFFFFFF&}:",
+                               ass_colour(name_colour(rec.color)), ass_escape(user))
+    local rows = wrap_tokens(tokenize(rec, cap, merge), cols, head,
+                             uwidth(user) + 1)
+    rec.wrap = { key = key, rows = rows }
+    return rows
+end
+
+-- The box: black behind the chat, then border, head and corners while
+-- the chrome is up or a hand holds it. Drawn first, so the lines sit on
+-- top. The OSC is z 1000 and this overlay 0, so a box pulled under the
+-- seekbar stays under it.
+local function draw_box(g, vis, sy, out)
+    local lit = locked and 0 or (hand and 1 or chrome)
+    if backdrop * vis > 0 then
+        out[#out + 1] = string.format(
+            "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H%02X&\\p1}%s",
+            ab(backdrop * vis), rrect(g.bx, g.by, g.bw, g.bh, UI.radius))
+    end
+    -- The head's words also carry the backdrop note, which shows even on a
+    -- locked box: it answers the wheel, not the pointer moving.
+    local said = note and 1 or lit
+    if said * vis > 0 then
+        out[#out + 1] = string.format(
+            "{\\an5\\pos(%.1f,%.1f)\\fn%s\\fs%d\\bord0\\shad0\\c&HFFFFFF&\\1a&H%02X&}%s",
+            g.bx + g.bw / 2, g.by + UI.head_h / 2, UI.head_font, UI.head_fs,
+            ab(0.7 * said * vis), note or "⋮⋮   Chat   ⋮⋮")
+    end
+    if lit * vis > 0 then
+        -- One real pixel of border whatever the screen.
+        out[#out + 1] = string.format(
+            "{\\an7\\pos(0,0)\\bord%.3f\\shad0\\1a&HFF&\\3c%s\\3a&H%02X&\\p1}%s",
+            1 / (sy or 1), ass_colour(UI.accent), ab(lit * vis),
+            rrect(g.bx, g.by, g.bw, g.bh, UI.radius))
+        out[#out + 1] = string.format(
+            "{\\an6\\pos(%.1f,%.1f)\\fn%s\\fs%d\\bord0\\shad0\\c&HFFFFFF&\\1a&H%02X&}✕",
+            g.bx + g.bw - 8, g.by + UI.head_h / 2, UI.head_font, UI.close_fs,
+            ab((hover == "close" and 1 or 0.7) * lit * vis))
+    end
+    for _, c in ipairs(UI.corners) do
+        local on = not locked and ((hover == c.name) or (hand and hand.zone == c.name))
+        local ga = (on and 1 or 0.6 * lit) * vis
+        if ga > 0 then
+            local gx = (c.ax < 0) and g.bx or (g.bx + g.bw - UI.grip)
+            local gy = (c.ay < 0) and g.by or (g.by + g.bh - UI.grip)
+            out[#out + 1] = string.format(
+                "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\1a&H%02X&\\p1}%s",
+                ass_colour(UI.accent), ab(ga), rrect(gx, gy, UI.grip, UI.grip, 0))
+        end
+    end
+end
+
+-- Scrolled up while lines kept coming: how many, and the way back.
+local function draw_pill(g, vis, out)
+    pill_rect = nil
+    local unseen = held and (cursor - held) or 0
+    if unseen > 0 then
+        local words = unseen .. " new  ↓"
+        local pw = (uwidth(words) + 1) * UI.pill_fs * CHAR_W_RATIO + 28
+        local px0 = g.text_x + (g.text_w - pw) / 2
+        local py0 = g.bot - UI.pill_h - 8
+        pill_rect = { x = px0, y = py0, w = pw, h = UI.pill_h }
+        out[#out + 1] = string.format(
+            "{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\1a&H%02X&\\p1}%s",
+            ass_colour(UI.accent), ab(vis), rrect(px0, py0, pw, UI.pill_h, UI.pill_h / 2))
+        out[#out + 1] = string.format(
+            "{\\an5\\pos(%.1f,%.1f)\\fn%s\\fs%d\\b1\\bord0\\shad0\\c%s\\1a&H%02X&}%s",
+            px0 + pw / 2, py0 + UI.pill_h / 2, FONT, UI.pill_fs, ass_colour(UI.pill_ink),
+            ab(vis), words)
+    end
 end
 
 function render()
@@ -1299,6 +1592,8 @@ function render()
         overlay.data = ""
         overlay:update()
         clear_overlays()
+        pill_rect = nil
+        if area_sync then area_sync() end
         if vis_wait ~= 0 then
             vis_wait = 0
             publish_translate()
@@ -1309,157 +1604,163 @@ function render()
     -- `layout` must be resolved BEFORE it is used: an earlier version read it
     -- one line above its own `local`, so it picked up a nil global and "over"
     -- silently used COL_BESIDE for its width.
-    local layout  = (mode ~= "off") and mode or last_layout
-    local over    = (layout == "over")
-    local col_w   = RES_X * (over and COL_OVER or COL_BESIDE)
-    -- "beside" is flush right (the video is margined out of the way anyway);
-    -- "over" is inset by OVER_GAP_R so it does not hug the screen edge.
-    local x0      = RES_X - col_w - (over and (RES_X * OVER_GAP_R) or 0)
-    local text_x  = x0 + PAD
-    local text_w  = col_w - 2 * PAD
-    local line_h  = FONT_SIZE * LINE_SPACE
-    local char_w  = FONT_SIZE * CHAR_W_RATIO   -- one Latin cell; CJK is two
-    local cols    = math.max(8, math.floor(text_w / char_w))
-    local top_px  = PAD + osc_t * RES_Y
-    local bot_px  = PAD + osc_b * RES_Y
-    local y0      = top_px
-    local panel_h = over and (RES_Y * OVER_RATIO) or (RES_Y - top_px - bot_px)
-    -- "over" is top-anchored and short, so it normally clears the OSC; clamp
-    -- anyway in case a future layout makes the bottom bar tall.
-    if y0 + panel_h > RES_Y - bot_px then panel_h = RES_Y - bot_px - y0 end
-    if panel_h < line_h then panel_h = line_h end
-    local max_ln  = math.max(1, math.floor((panel_h - 2 * PAD) / line_h))
-    -- A message occupies at least one row, so at most max_ln of them can be on
-    -- screen and the images they claim can never exceed max_ln * cap. Deriving
-    -- the cap from the pool keeps that product inside #OV_IDS BY CONSTRUCTION,
-    -- which is what makes it safe to stop collapsing runs: the short "over"
-    -- panel (8 rows -> cap 7 -> 56 <= 63) shows every emote a message sent,
-    -- while the full-height layout (37 rows) keeps the collapse and the
-    -- measured cap of 6 and degrades off the top as before.
-    -- In practice "over" holds fewer than 56 images anyway: emote cell width
-    -- follows the image aspect (3-5 cells for real shapes), so some 7-emote
-    -- messages wrap onto a second row and the panel self-limits.
-    local cap     = MAX_PER_MSG
-    local merge   = true
-    if over then
-        cap   = math.max(MAX_PER_MSG, math.floor(#OV_IDS / max_ln))
-        merge = false
-    end
+    local layout = (mode ~= "off") and mode or last_layout
+    local over   = (layout == "over")
+    local g      = geometry(layout)
+    local line_h = FONT_SIZE * LINE_SPACE
+    local char_w = FONT_SIZE * CHAR_W_RATIO   -- one Latin cell; CJK is two
+    local band   = math.max(0, g.bot - g.top)
 
-    -- Build newest-first until the panel is full, then flip for drawing.
-    local list, lines = visible_slice(), {}
-    -- Untranslated Japanese among what is actually DRAWN, counted inside the
-    -- loop below rather than over `list`: the slice holds up to MAX_SHOW
-    -- candidates while the panel fits only `max_ln` rows, so counting the
-    -- slice reported 60 waiting lines for an eight row panel.
-    local wait = 0
-    for i = #list, 1, -1 do
-        local rec  = list[i]
-        if tr_on and rec.ja and not rec.en then wait = wait + 1 end
-        local user = rec.user or "?"
-        -- No trailing space: wrap_tokens inserts the separator itself, so
-        -- ending the head with ": " would render a double space.
-        local head = string.format("{\\b1\\c%s}%s{\\b0\\c&HFFFFFF&}:",
-                                   ass_colour(rec.color), ass_escape(user))
-        local block = wrap_tokens(tokenize(rec, cap, merge), cols, head,
-                                  uwidth(user) + 1)
+    -- Rows newest first, from the newest message shown (the held one while
+    -- scrolled up) until the band and what is scrolled away below it are
+    -- covered, plus one row for the line the top edge cuts through.
+    advance()
+    local rows, owner = {}, {}
+    local i = held or cursor
+    while i >= 1 and #rows * line_h < band + scroll + line_h do
+        local block = rows_of(msgs[i], g.cols, g.cap, g.merge)
         for j = #block, 1, -1 do
-            table.insert(lines, 1, block[j])
-            if #lines >= max_ln then break end
+            rows[#rows + 1] = block[j]
+            owner[#rows] = msgs[i]
         end
-        if #lines >= max_ln then break end
+        i = i - 1
     end
-    if wait ~= vis_wait then
-        vis_wait = wait
-        publish_translate()
-    end
-
-    if #lines == 0 and source then
-        lines = { { ass = string.format(
-            "{\\i1\\c&HA0A0A0&}connecting to %s\\N%s...{\\i0}",
-            ass_escape(source.platform), ass_escape(source.target:sub(1, 40))),
-            emotes = {} } }
+    -- Nothing older left: the view goes no higher than the first line.
+    scroll_most = math.huge
+    if i < 1 then
+        scroll_most = math.max(0, #rows * line_h - band)
+        if scroll > scroll_most then scroll = scroll_most end
+        if glide and glide.to > scroll_most then glide.to = scroll_most end
     end
 
-    local a = alpha_tag(alpha)
+    if #rows == 0 and source then
+        rows = {
+            { ass = string.format("{\\i1\\c&HA0A0A0&}%s...{\\i0}",
+                                  ass_escape(source.target:sub(1, 40))), emotes = {} },
+            { ass = string.format("{\\i1\\c&HA0A0A0&}connecting to %s{\\i0}",
+                                  ass_escape(source.platform)), emotes = {} },
+        }
+    end
+
+    local vis = 1 - alpha / 255     -- how far chat is faded in
     local out = {}
 
     -- overlay-add works in real OSD pixels, not the ASS virtual canvas.
     local osd = mp.get_property_native("osd-dimensions") or {}
     local sx  = (tonumber(osd.w) or 0) > 0 and (osd.w / RES_X) or nil
     local sy  = (tonumber(osd.h) or 0) > 0 and (osd.h / RES_Y) or nil
+    if sx and sy then osd_sx, osd_sy, osd_w, osd_h = sx, sy, osd.w, osd.h end
+
+    if over then draw_box(g, vis, sy, out) end
+
+    -- The lines. rows[1] is the newest, its bottom `scroll` below the band.
+    -- Text is cut at the band's edges by \clip; images are cut further down,
+    -- by drawing only the part of the picture inside the band.
+    local clip = string.format("\\clip(0,%d,%d,%d)", math.floor(g.top), RES_X,
+                               math.ceil(g.bot))
+    -- On 60 % black the text needs no outline. As the backdrop thins toward
+    -- nothing the outline comes back, up to the 2 that "beside" uses.
+    local bord = 2
+    if over then bord = 2 * math.max(0, math.min(1, (0.5 - backdrop) / 0.5)) end
+    local a = alpha_tag(alpha)
     local em_px  = char_w * EMOTE_COLS
     local show_e = sx and sy and alpha < 128     -- overlays cannot fade
     local place  = {}                            -- collected, allocated below
-
-    -- "over" grows DOWNWARD from the top edge. The panel is short, so
-    -- bottom-anchoring left a visible gap above the first line (the panel's
-    -- leftover slack plus padding) and there is no backdrop to hide it any
-    -- more. Starts at y0 rather than y0 + PAD to sit that bit closer to the top.
-    -- "beside" is a full-height column, so there the newest line stays pinned
-    -- to the bottom edge, which is how chat normally reads.
-    local y
-    if layout == "over" then
-        y = y0
-    else
-        y = y0 + panel_h - PAD - (#lines * line_h)
-        if y < y0 + PAD then y = y0 + PAD end
-    end
-    for _, l in ipairs(lines) do
-        out[#out + 1] = string.format(
-            "{\\an7\\pos(%.1f,%.1f)\\fn%s\\fs%d\\bord2\\shad0\\q2\\c&HFFFFFF&}%s%s",
-            text_x, y, FONT, FONT_SIZE, a, l.ass)
-        if show_e then
-            for _, em in ipairs(l.emotes or {}) do
-                place[#place + 1] = { y = y, col = em.col, url = em.url }
+    -- Untranslated Japanese among what is actually DRAWN, so the count says
+    -- whether the chat on screen is in English.
+    local wait, counted = 0, {}
+    local y_b = g.bot + scroll
+    for k = #rows, 1, -1 do
+        local yt = y_b - k * line_h
+        if yt + line_h > g.top and yt < g.bot then
+            local l = rows[k]
+            out[#out + 1] = string.format(
+                "{\\an7\\pos(%.1f,%.1f)%s\\fn%s\\fs%d\\bord%.2f\\shad0\\q2\\c&HFFFFFF&}%s%s",
+                g.text_x, yt, clip, FONT, FONT_SIZE, bord, a, l.ass)
+            if show_e then
+                for _, em in ipairs(l.emotes or {}) do
+                    place[#place + 1] = { y = yt, col = em.col, url = em.url }
+                end
+            end
+            local rec = owner[k]
+            if rec and tr_on and rec.ja and not rec.en and not counted[rec] then
+                counted[rec] = true
+                wait = wait + 1
             end
         end
-        y = y + line_h
+    end
+    if wait ~= vis_wait then
+        vis_wait = wait
+        publish_translate()
     end
 
-    -- Allocate NEWEST-FIRST. `lines` runs oldest -> newest, so walk the
-    -- collected placements backwards: when the pool runs dry the images drop
-    -- off the TOP of the panel, not off the messages just arriving.
+    draw_pill(g, vis, out)
+
+    -- Allocate NEWEST-FIRST. `place` runs oldest -> newest, so walk it
+    -- backwards: when the pool runs dry the images drop off the TOP of the
+    -- panel, not off the messages just arriving.
     local used, animated = 0, 0
     anim_slots = {}
-    for i = #place, 1, -1 do
+    local ctop = sy and g.top * sy
+    local cbot = sy and g.bot * sy
+    for n = #place, 1, -1 do
         if used >= #OV_IDS then break end
-        local pl   = place[i]
+        local pl   = place[n]
         local meta = emote_meta(pl.url)
-        if meta then
-            used = used + 1
-            local id  = OV_IDS[used]
-            local px  = math.floor((text_x + pl.col * char_w) * sx + 0.5)
-            local py  = math.floor((pl.y + (line_h - em_px) / 2) * sy + 0.5)
+        if meta and meta.h > 0 then
             -- Height pinned to the line, width from the image's own aspect
             -- (never force 1:1 -- wide emotes exist and get mangled by it),
             -- clamped to the cells wrap_tokens actually reserved.
-            local ar  = (meta.h > 0) and (meta.w / meta.h) or 1
-            local ew  = math.min(em_px * ar, char_w * EMOTE_COLS_MAX)
-            local dw  = math.floor(ew * sx + 0.5)
-            local dh  = math.floor(em_px * sy + 0.5)
-            -- Animate only the newest ANIM_MAX; `place` is walked newest
-            -- first, so an emote wall freezes the OLD ones, matching how the
-            -- image pool itself degrades.
-            local off = 0
-            if ANIM and meta.n > 1 and meta.fps > 0 and animated < ANIM_MAX then
-                animated = animated + 1
-                off = frame_offset(meta.fps, meta.n, meta.frame_bytes)
-                anim_slots[id] = {
-                    path = meta.path, px = px, py = py, dw = dw, dh = dh,
-                    w = meta.w, h = meta.h, n = meta.n, fps = meta.fps,
-                    frame_bytes = meta.frame_bytes,
-                }
-            end
-            local sig = table.concat({ meta.path, px, py, dw, dh, off }, "|")
-            -- Skip unchanged placements: re-issuing every visible emote on
-            -- every redraw is ~250 commands/s for a picture that has not moved.
-            if ov_active[id] ~= sig then
-                mp.command_native_async({
-                    "overlay-add", id, px, py,
-                    meta.path, off, "bgra", meta.w, meta.h, meta.w * 4, dw, dh,
-                }, function() end)
-                ov_active[id] = sig
+            local ex = g.text_x + pl.col * char_w
+            local ey = pl.y + (line_h - em_px) / 2
+            local ew = math.min(em_px * (meta.w / meta.h), char_w * EMOTE_COLS_MAX)
+            -- Images are always drawn above the ASS, so one under the pill
+            -- would cover it. Its cells are blank, so leaving it out is clean.
+            local p = pill_rect
+            local under = p and ex < p.x + p.w and ex + ew > p.x
+                          and ey < p.y + p.h and ey + em_px > p.y
+            -- Cut at the band's edges in source rows: `cut_t` rows skipped at
+            -- the top through the byte offset, `cut_b` dropped at the bottom
+            -- through the height. overlay-add reads any rectangle of the file
+            -- this way (offset = first pixel, stride = bytes per row).
+            local py = ey * sy
+            local dh = em_px * sy
+            local k  = dh / meta.h                -- real px per source row
+            local cut_t = (py < ctop) and math.ceil((ctop - py) / k) or 0
+            local cut_b = (py + dh > cbot) and math.ceil((py + dh - cbot) / k) or 0
+            local ch = meta.h - cut_t - cut_b
+            if not under and ch >= 1 then
+                used = used + 1
+                local id   = OV_IDS[used]
+                local px   = math.floor(ex * sx + 0.5)
+                local y    = math.floor(py + cut_t * k + 0.5)
+                local dw   = math.floor(ew * sx + 0.5)
+                local dhc  = math.floor(ch * k + 0.5)
+                local crop = cut_t * meta.w * 4
+                -- Animate only the newest ANIM_MAX; `place` is walked newest
+                -- first, so an emote wall freezes the OLD ones, matching how
+                -- the image pool itself degrades.
+                local off = 0
+                if ANIM and meta.n > 1 and meta.fps > 0 and animated < ANIM_MAX then
+                    animated = animated + 1
+                    off = frame_offset(meta.fps, meta.n, meta.frame_bytes)
+                    anim_slots[id] = {
+                        path = meta.path, px = px, py = y, dw = dw, dh = dhc,
+                        w = meta.w, ch = ch, crop = crop, n = meta.n,
+                        fps = meta.fps, frame_bytes = meta.frame_bytes,
+                    }
+                end
+                off = off + crop
+                local sig = table.concat({ meta.path, px, y, dw, dhc, off }, "|")
+                -- Skip unchanged placements: re-issuing every visible emote on
+                -- every redraw is ~250 commands/s for a picture that has not moved.
+                if ov_active[id] ~= sig then
+                    mp.command_native_async({
+                        "overlay-add", id, px, y,
+                        meta.path, off, "bgra", meta.w, ch, meta.w * 4, dw, dhc,
+                    }, function() end)
+                    ov_active[id] = sig
+                end
             end
         end
     end
@@ -1482,11 +1783,16 @@ function render()
                            { shown = cursor, buffered = #msgs,
                              images = used, animated = animated,
                              delay = math.floor(smooth_delay * 10 + 0.5) / 10,
-                             rows = max_ln })
+                             rows = g.rows, held = held or false,
+                             scroll = math.floor(scroll + 0.5),
+                             box = { box.x, box.y, box.w, box.h },
+                             backdrop = backdrop, locked = locked,
+                             chrome = math.floor(chrome * 100 + 0.5) / 100 })
 
     overlay.res_x, overlay.res_y = RES_X, RES_Y
     overlay.data = table.concat(out, "\n")
     overlay:update()
+    if area_sync then area_sync() end
 end
 
 ---------------------------------------------------------------------- fade
@@ -1535,6 +1841,11 @@ local function apply_mode(announce)
         fade_to(0)
     end
     if announce ~= false then mp.osd_message("Chat: " .. mode, 1.5) end
+    if mode == "off" then
+        if hand then hand.timer:kill() end
+        hand, pressed, hover = nil, nil, nil
+    end
+    if area_sync then area_sync() end
     -- Separate from user-data/chat_overlay: that one is only written by
     -- render(), which early-returns while chat is off, so it cannot report
     -- the off state.
@@ -1553,6 +1864,432 @@ local function toggle()
     mode = MODES[(i % #MODES) + 1]
     apply_mode()
 end
+
+------------------------------------------------------------- the box by hand
+
+-- A function rather than a do-block: LuaJIT allows 200 locals ACTIVE at once
+-- in a function, and a block's locals count on top of the chunk's own.
+local function box_by_hand()
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+-- Where the box and its backdrop are kept between runs.
+local BOX_FILE = (os.getenv("XDG_STATE_HOME")
+                  or ((os.getenv("HOME") or ".") .. "/.local/state"))
+                 .. "/mpv/chat-box.json"
+local save_timer = nil
+
+local function load_box()
+    local fh = io.open(BOX_FILE, "r")
+    if not fh then return end
+    local j = utils.parse_json(fh:read("*a") or "")
+    fh:close()
+    if type(j) ~= "table" then return end
+    local x, y = tonumber(j.x), tonumber(j.y)
+    local w, h = tonumber(j.w), tonumber(j.h)
+    if x and y and w and h then
+        box.w = clamp(w, UI.min_w, 1)
+        box.h = clamp(h, UI.min_h, 1)
+        box.x = clamp(x, 0, 1 - box.w)
+        box.y = clamp(y, 0, 1 - box.h)
+    end
+    local b = tonumber(j.backdrop)
+    if b then backdrop = clamp(b, 0, 1) end
+    locked = (j.locked == true)
+end
+
+local function write_box()
+    local fh = io.open(BOX_FILE, "w")
+    if not fh then
+        os.execute(string.format("mkdir -p %q", BOX_FILE:match("^(.*)/")))
+        fh = io.open(BOX_FILE, "w")
+    end
+    if not fh then return end
+    fh:write(utils.format_json({ x = box.x, y = box.y, w = box.w, h = box.h,
+                                 backdrop = backdrop, locked = locked }))
+    fh:close()
+end
+
+-- Written a moment after the last change, so one turn of the wheel is one
+-- write and not ten.
+local function save_box()
+    if save_timer then save_timer:kill() end
+    save_timer = mp.add_timeout(1.0, function()
+        save_timer = nil
+        write_box()
+    end)
+end
+
+flush_box = function()
+    if save_timer then
+        save_timer:kill()
+        save_timer = nil
+        write_box()
+    end
+end
+
+-- Border, head and corners fade in and out rather than blink.
+local function chrome_fade(to)
+    chrome_to = to
+    if chrome_timer then return end
+    chrome_timer = mp.add_periodic_timer(UI.frame, function()
+        local step = UI.frame / UI.fade
+        if chrome < chrome_to then
+            chrome = math.min(chrome_to, chrome + step)
+        else
+            chrome = math.max(chrome_to, chrome - step)
+        end
+        if chrome == chrome_to then
+            chrome_timer:kill()
+            chrome_timer = nil
+        end
+        render()
+    end)
+end
+
+-- Movement brings the chrome back and stillness takes it away. It stays
+-- while a hand holds the box. A new timer per movement:
+-- kill() and resume() would carry on from the time already run.
+local wake
+local function nap()
+    nap_timer = nil
+    if hand then wake() else chrome_fade(0) end
+end
+
+wake = function()
+    if mode ~= "over" or locked then return end
+    if chrome_to ~= 1 then chrome_fade(1) end
+    if nap_timer then nap_timer:kill() end
+    nap_timer = mp.add_timeout(UI.nap, nap)
+end
+
+-- Which part of the box (or column) is at a point in OSD pixels.
+local function zone_at(mx, my)
+    if mode == "off" or not osd_sx then return nil end
+    local vx, vy = mx / osd_sx, my / osd_sy
+    local g = geometry(mode)
+    if mode == "over" then
+        -- Corners first: they overlap the head and the body.
+        for _, c in ipairs(UI.corners) do
+            local x0 = (c.ax < 0) and (g.bx - UI.grip_out) or (g.bx + g.bw - UI.grip_in)
+            local y0 = (c.ay < 0) and (g.by - UI.grip_out) or (g.by + g.bh - UI.grip_in)
+            if vx >= x0 and vx <= x0 + UI.grip_in + UI.grip_out
+               and vy >= y0 and vy <= y0 + UI.grip_in + UI.grip_out then
+                return c.name
+            end
+        end
+        if vx < g.bx or vx > g.bx + g.bw or vy < g.by or vy > g.by + g.bh then
+            return nil
+        end
+        if vy < g.by + UI.head_h then
+            return (vx > g.bx + g.bw - UI.close_w) and "close" or "carry"
+        end
+    elseif vx < g.bx then
+        return nil
+    end
+    local p = pill_rect
+    if p and vx >= p.x and vx <= p.x + p.w and vy >= p.y and vy <= p.y + p.h then
+        return "pill"
+    end
+    return "body"
+end
+
+-- The input section covers the box (its corners reach a little outside) or
+-- the column, and the whole window while a hand holds the box, so the
+-- release is caught wherever it happens. Inside it, mpv's own left-button
+-- window dragging, double-click fullscreen and wheel are not reached.
+local area_on, area_key = false, nil
+local head_on, head_key = false, nil
+
+-- The head's own section, "over" only. In "beside" a right click anywhere
+-- on the column still pauses.
+local function head_sync()
+    if mode ~= "over" or not osd_sx then
+        if head_on then
+            mp.disable_key_bindings(UI.section_head)
+            head_on, head_key = false, nil
+        end
+        return
+    end
+    local g = geometry("over")
+    local o = UI.grip_out
+    local x0 = math.floor((g.bx - o) * osd_sx)
+    local y0 = math.floor((g.by - o) * osd_sy)
+    local x1 = math.ceil((g.bx + g.bw + o) * osd_sx)
+    local y1 = math.ceil((g.by + UI.head_h) * osd_sy)
+    local key = x0 .. "," .. y0 .. "," .. x1 .. "," .. y1
+    if key ~= head_key then
+        mp.set_mouse_area(x0, y0, x1, y1, UI.section_head)
+        head_key = key
+    end
+    if not head_on then
+        mp.enable_key_bindings(UI.section_head, "allow-hide-cursor")
+        head_on = true
+    end
+end
+
+area_sync = function()
+    head_sync()
+    if mode == "off" or not osd_sx then
+        if area_on then
+            mp.disable_key_bindings(UI.section)
+            area_on, area_key = false, nil
+        end
+        return
+    end
+    local x0, y0, x1, y1
+    if hand then
+        x0, y0, x1, y1 = 0, 0, osd_w, osd_h
+    else
+        local g = geometry(mode)
+        local o = (mode == "over") and UI.grip_out or 0
+        x0, y0 = (g.bx - o) * osd_sx, (g.by - o) * osd_sy
+        x1, y1 = (g.bx + g.bw + o) * osd_sx, (g.by + g.bh + o) * osd_sy
+    end
+    x0, y0 = math.floor(x0), math.floor(y0)
+    x1, y1 = math.ceil(x1), math.ceil(y1)
+    local key = x0 .. "," .. y0 .. "," .. x1 .. "," .. y1
+    if key ~= area_key then
+        mp.set_mouse_area(x0, y0, x1, y1, UI.section)
+        area_key = key
+    end
+    if not area_on then
+        mp.enable_key_bindings(UI.section, "allow-hide-cursor")
+        area_on = true
+    end
+end
+
+local function drag_to(mx, my)
+    local dx = (mx - hand.mx) / osd_w
+    local dy = (my - hand.my) / osd_h
+    local b0 = hand.box
+    local c  = hand.corner
+    if not c then
+        box.x = clamp(b0.x + dx, 0, 1 - b0.w)
+        box.y = clamp(b0.y + dy, 0, 1 - b0.h)
+    else
+        -- A corner sizes the box from the opposite one, which stays put.
+        if c.ax > 0 then
+            box.w = clamp(b0.w + dx, UI.min_w, 1 - b0.x)
+        else
+            local left = clamp(b0.x + dx, 0, b0.x + b0.w - UI.min_w)
+            box.x, box.w = left, b0.x + b0.w - left
+        end
+        if c.ay > 0 then
+            box.h = clamp(b0.h + dy, UI.min_h, 1 - b0.y)
+        else
+            local top = clamp(b0.y + dy, 0, b0.y + b0.h - UI.min_h)
+            box.y, box.h = top, b0.y + b0.h - top
+        end
+    end
+    -- Drawn by the hand timer, not here: the pointer reports up to ~150
+    -- moves a second, and each redraw re-places every image on screen.
+    dirty = true
+end
+
+local function stop_glide()
+    glide = nil
+    if glide_timer then
+        glide_timer:kill()
+        glide_timer = nil
+    end
+end
+
+-- Back to the newest line and following again.
+local function follow()
+    held, scroll = nil, 0
+    stop_glide()
+    render()
+end
+
+local function glide_to(to)
+    glide = { from = scroll, to = math.max(0, to), t0 = mp.get_time() }
+    if glide_timer then return end
+    glide_timer = mp.add_periodic_timer(UI.frame, function()
+        if glide then
+            local t = (mp.get_time() - glide.t0) / UI.glide_time
+            if t >= 1 then
+                scroll = glide.to
+                glide = nil
+            else
+                local e = 1 - (1 - t) ^ 3        -- OutCubic
+                scroll = glide.from + (glide.to - glide.from) * e
+            end
+            render()
+        end
+        if not glide then stop_glide() end
+    end)
+end
+
+-- How tall the messages a..b are, or nil when there are too many to bother.
+local function height_of(a, b)
+    if b - a + 1 > UI.rejoin_max then return nil end
+    local g = geometry(mode)
+    local n = 0
+    for i = a, b do
+        n = n + #rows_of(msgs[i], g.cols, g.cap, g.merge)
+    end
+    return n * FONT_SIZE * LINE_SPACE
+end
+
+local function scroll_by(dir)
+    local step = UI.scroll_rows * FONT_SIZE * LINE_SPACE
+    local from = glide and glide.to or scroll
+    if dir < 0 then
+        -- Nothing older to show: no hold either, or new lines would stop.
+        if from >= scroll_most then return end
+        -- Up and away from the newest line lets go of it at once, or a line
+        -- coming in during the glide would pull the view back down.
+        if not held then held = cursor end
+        glide_to(from + step)
+        return
+    end
+    if from - step > 0 then
+        glide_to(from - step)
+        return
+    end
+    if not held then
+        if scroll > 0 then glide_to(0) end
+        return
+    end
+    -- Down to the newest line takes hold of it again. What came in meanwhile
+    -- sits below the held view and glides in, unless it is too much.
+    local extra = (held < cursor) and height_of(held + 1, cursor) or 0
+    if not extra then
+        follow()
+        return
+    end
+    held = nil
+    scroll = scroll + extra
+    glide_to(0)
+end
+
+local function on_wheel(dir)
+    local z = zone_at(mouse_x, mouse_y)
+    if not z then return end
+    if z == "carry" or z == "close" or z == "grip_tl" or z == "grip_tr" then
+        backdrop = clamp(math.floor((backdrop - dir * UI.backdrop_step) * 10 + 0.5) / 10,
+                         0, 1)
+        note = string.format("Backdrop %d %%", math.floor(backdrop * 100 + 0.5))
+        if note_timer then note_timer:kill() end
+        note_timer = mp.add_timeout(UI.note_time, function()
+            note_timer, note = nil, nil
+            render()
+        end)
+        save_box()
+        wake()
+        render()
+        return
+    end
+    scroll_by(dir)
+end
+
+local function on_down()
+    local z = zone_at(mouse_x, mouse_y)
+    if not z or z == "body" then return end
+    if z == "pill" or (z == "close" and not locked) then
+        pressed = z
+        return
+    end
+    if locked then return end
+    local corner = nil
+    for _, c in ipairs(UI.corners) do
+        if c.name == z then corner = c end
+    end
+    hand = { zone = z, corner = corner, mx = mouse_x, my = mouse_y,
+             box = { x = box.x, y = box.y, w = box.w, h = box.h } }
+    -- At most one redraw a frame while held. Measured with 63 images on
+    -- screen: a redraw per pointer move (151/s) took 70 % of a core on mpv's
+    -- main thread for the overlay-add commands alone.
+    hand.timer = mp.add_periodic_timer(UI.frame, function()
+        if dirty then render() end
+    end)
+    render()
+end
+
+local function on_up()
+    if hand then
+        hand.timer:kill()
+        hand = nil
+        save_box()
+        hover = zone_at(mouse_x, mouse_y)
+        wake()
+        render()
+        return
+    end
+    local was = pressed
+    pressed = nil
+    if not was or zone_at(mouse_x, mouse_y) ~= was then return end
+    if was == "close" then
+        -- The close mark: the picture without chat, as F10 to "off".
+        mode = "off"
+        apply_mode()
+    else
+        follow()
+    end
+end
+
+-- A right click on the head locks the box where it is, and unlocks it.
+local function on_right()
+    if hand then return end
+    locked = not locked
+    if locked then
+        if nap_timer then
+            nap_timer:kill()
+            nap_timer = nil
+        end
+        chrome_fade(0)
+    else
+        wake()
+    end
+    mp.osd_message(locked and "Chat box locked" or "Chat box unlocked", 1.5)
+    save_box()
+    render()
+end
+
+mp.set_key_bindings({
+    { "mbtn_right", on_right },
+}, UI.section_head, "force")
+
+mp.set_key_bindings({
+    { "mbtn_left",     on_up, on_down },
+    { "mbtn_left_dbl", function() end },
+    { "wheel_up",      function() on_wheel(-1) end },
+    { "wheel_down",    function() on_wheel(1) end },
+}, UI.section, "force")
+
+mp.observe_property("mouse-pos", "native", function(_, m)
+    if type(m) ~= "table" then return end
+    mouse_x, mouse_y = tonumber(m.x) or 0, tonumber(m.y) or 0
+    if mode == "off" then return end
+    if hand then
+        drag_to(mouse_x, mouse_y)
+        return
+    end
+    local z = m.hover and zone_at(mouse_x, mouse_y) or nil
+    wake()
+    if z ~= hover then
+        hover = z
+        render()
+    end
+end)
+
+-- A resized window moves the box's pixels and the input area with it.
+mp.observe_property("osd-dimensions", "native", function()
+    if mode ~= "off" then
+        dirty = true
+        render()
+    end
+end)
+
+load_box()
+
+end
+box_by_hand()
 
 ------------------------------------------------------------------- wiring
 
@@ -1593,6 +2330,7 @@ mp.register_event("end-file", function()
 end)
 
 mp.register_event("shutdown", function()
+    flush_box()
     clear_overlays()
     stop_helper()
     mp.set_property_number("video-margin-ratio-right", 0)
@@ -1637,7 +2375,9 @@ mp.register_event("seek", function()
         read_pos, pending, msgs = 0, "", {}
         by_n, line_no = {}, 0
     end
-    cursor = 0   -- rebuild the walk from scratch; visible_slice re-advances it
+    cursor = 0   -- rebuild the walk from scratch; advance() walks it again
+    -- A held view belongs to the part left behind.
+    held, scroll, glide = nil, 0, nil
     dirty  = true
 end)
 
