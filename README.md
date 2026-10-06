@@ -1,525 +1,89 @@
 # mpv config
 
-My everyday video player. It is one mpv process that plays local files, YouTube and Twitch,
-upscales everything with a neural network shader on the GPU, remembers the volume of every
-video I have ever watched, paints live chat next to the picture while a stream plays, and turns
-Japanese speech into English subtitles on the fly, recognised and translated on the GPU without
-anything leaving the machine. A click on "Play in mpv" in the browser sends the page's video
-straight to it, and if no player is running yet that click starts one.
-
-![Player with the OSC visible](docs/screenshots/player.jpg)
-
-**This is built for one person and one television.** Almost everything here follows my own
-taste and my own hardware rather than any general idea of how a player should behave. The
-shader that runs by default was chosen by watching two of them side by side on live action
-YouTube and picking the one I preferred. The point at which the player quietly drops to a
-lighter shader is a number I measured on an RTX 4080 SUPER, so it is wrong for your GPU. The
-window opens fullscreen on the HDMI input my television sits on. The stream format string asks
-for YouTube Premium enhanced bitrate, which does nothing without a Premium account. Short
-videos never resume where I left them because my short videos are music videos. Take the
-scripts, ignore the tuning, and throw away whatever does not suit you.
-
-The eight Lua scripts and the six helper programs are the interesting part and none of them
-exist anywhere else. Everything they need is written down below.
-
-## What is here and what you have to fetch yourself
-
-Only my own work is committed here, meaning the scripts, the key bindings and the settings
-files. Three things have to be downloaded once before this config works completely.
-
-```
-mpv/
-  mpv.conf            renderer, shader, cache, auth, window
-  input.conf          every key binding
-  scripts/            9 Lua scripts
-  script-opts/        my ModernZ and thumbfast settings
-  shaders/            EMPTY, drop the ArtCNN GLSL files in here
-  fonts/              EMPTY, drop modernz-icons.ttf in here
-bin/                  6 helper programs
-config/
-  ff2mpv-rust.json    the browser handoff glue
-vendor/
-  modernz.patch       my one change to the ModernZ source
-docs/screenshots/     the pictures in this file
-```
-
-* **ArtCNN** from https://github.com/Artoriuz/ArtCNN, folder `GLSL`. Six files are referenced
-  by name, `ArtCNN_C4F32_DS.glsl`, `ArtCNN_C4F16_DS.glsl`, `ArtCNN_C4F32_DN.glsl`,
-  `ArtCNN_C4F16_DN.glsl`, `ArtCNN_C4F32.glsl` and `ArtCNN_C4F16.glsl`. They are about 3 MB and
-  have not changed since early 2025.
-* **ModernZ** from https://github.com/Samillion/ModernZ, which replaces mpv's own on screen
-  controller. Copy its `modernz.lua` into `mpv/scripts/`, its icon font and its
-  `modernz-locale.json` into `mpv/fonts/` and `mpv/script-opts/`, then apply
-  `vendor/modernz.patch`. It takes the play and pause button out of the compact layout, since
-  a right click already pauses, and teaches the seek bar about SponsorBlock segments as
-  described further down. The patch is written against version 0.3.3. Without it you keep the
-  button and lose the segment marks.
-  ModernZ has to live in the user config folder rather than being installed as a package,
-  because mpv loads a script of the same name from both places and you end up with two
-  controllers stacked on top of each other.
-* **The recognition and translation models**, only if you want the Japanese subtitle feature.
-  Run `bin/mpv-translate-setup` once. It builds its own environment and downloads about 7 GB
-  into `~/.local/share/mpv-translate` and the model cache, all of it outside this clone.
-
-Programs that have to be present are `mpv`, `yt-dlp`, `socat`, `jq`, `python3`, `ffmpeg` for
-emote decoding, `streamlink` with the `streamlink-ttvlol` plugin for Twitch, and
-`ff2mpv-rust` for the browser handoff.
-
-One more mpv script is involved that is not mine and is not here, because it is installed
-system wide by its own package. **thumbfast** draws the preview thumbnail when you hover the
-seek bar, and `mpv/script-opts/thumbfast.conf` is my override of its settings, which turns
-previews on for network streams and starts the thumbnailer early so the first hover is not
-empty. Nothing breaks without it. You lose the previews, and the overlay slot that thumbfast
-reserves becomes one more emote.
-
-## Sending a video from the browser
-
-The browser side is the **ff2mpv** extension, which exists for Firefox on
-https://addons.mozilla.org/firefox/addon/ff2mpv/ and for Chrome on
-https://chromewebstore.google.com/detail/ff2mpv/ephjcajbkgplkjmelpglennepbpmdpjg. It adds a
-"Play in mpv" entry to the context menu of any page, link or video. The extension cannot start
-a program by itself, so it talks over Firefox's native messaging protocol to `ff2mpv-rust`,
-which is a tiny native program installed system wide. A manifest at
-`/usr/lib/mozilla/native-messaging-hosts/ff2mpv.json` is what allows the two to find each
-other. Firefox, Zen and Floorp all read that same folder, so one manifest covers all of them.
-
-`ff2mpv-rust` reads `config/ff2mpv-rust.json` and runs whatever `player_command` names. Here
-that is not mpv but `bin/mpv-ff2mpv-single.sh`, and that script is where the actual behaviour
-lives.
-
-* **One player, not one per click.** The wrapper keeps an IPC socket in the runtime folder. If
-  a player it started earlier is still alive it hands the new URL to that instance over the
-  socket, so a second click swaps the video in the fullscreen window on the television instead
-  of opening a second window somewhere. If nothing answers the socket it starts a fresh
-  player. That is the automatic start.
-* **YouTube URLs are rewritten before use.** mpv names its resume file after the MD5 of the
-  exact URL string it was given, so `watch?v=X` and `watch?v=X&t=1s` are two different videos
-  as far as resume is concerned. The browser hands over whatever the page had in its link, and
-  YouTube's own "continue watching" shelf appends a `&t=` to every entry, which happens to
-  every video this player touches because of the watch history ping described further down. So
-  the wrapper rebuilds the URL from the video id alone and drops `&t=`, `&si=`, `&pp=`,
-  `&index=` and `&ab_channel=`. The cost of this is that a timestamp somebody shared in a link
-  no longer jumps to that timestamp.
-* **Playlists are expanded, radio mixes are capped.** For a `watch?v=X&list=Y` URL mpv would
-  normally load only the single clicked video. The wrapper expands the whole playlist and then
-  a background job waits for the expansion to finish and jumps to the video that was actually
-  clicked. YouTube's automatic radio mixes contain a thousand or more entries and extract very
-  slowly, so those are cut off after 50.
-* **Twitch goes through streamlink.** A Twitch URL is resolved to a direct HLS playlist by
-  `streamlink` first and only then handed to mpv. With the `streamlink-ttvlol` plugin
-  installed this also strips the ads that Twitch stitches into the stream itself, which no
-  browser blocker can remove. The same call reports what the channel is streaming, so the
-  player shows the channel name, the title of the stream and its category rather than the
-  bare URL a resolved playlist would otherwise be called. That playlist names the channel
-  nowhere, so the name is handed to the chat overlay and the volume store directly.
-
-![A YouTube playlist expanded in the player](docs/screenshots/playlist.jpg)
-
-An expanded playlist is a real mpv playlist and nothing more, so everything mpv already does
-with playlists applies. **g** then **p** opens the entry picker above, which is mpv's own and
-searchable by typing, the controller gets its playlist button, and the previous and next keys
-walk the list. The 70 entries in that picture came out of one click in the browser.
-
-`bin/mpv-queue-toggle` exists so the queue mode described below can also be switched while the
-browser has focus and the player is fullscreen on another screen. Bind it to a global desktop
-shortcut. It prefers to hand the toggle to the running player over IPC so that there is only
-one implementation of the state change, and falls back to writing the flag file itself when no
-player is running.
-
-## Live chat over the video
-
-![Chat beside the video](docs/screenshots/chat_beside.jpg)
-
-`scripts/chat_overlay.lua` draws the chat of a live stream or a recording as part of the video
-output. **F10** cycles through three states, off, beside and over.
-
-* **beside** shrinks the picture into the left part of the window and gives chat its own
-  column, so nothing is covered.
-* **over** leaves the picture at full size and puts chat in a box over it, at the top right
-  at first. Drag its head to move it and a corner to size it, and it keeps that place and size
-  from then on. The wheel over the head makes the backdrop darker or lighter, and a right click
-  on the head locks the box so it can no longer be moved and stays plain when the mouse moves.
-
-The wheel over the chat scrolls back through it in both layouts. While you read older lines the
-chat holds still and a button counts the new ones, and scrolling back down or a click on that
-button follows the chat again.
-
-![Chat over the video](docs/screenshots/chat_over.jpg)
-
-Three sources are supported and all three are normalised into one line based format by
-`bin/mpv-chat-source` before the Lua side sees them. Twitch live chat is read from Twitch's
-IRC gateway as an anonymous user, so no account and no token are involved. YouTube live chat
-comes from the live chat track that `yt-dlp` can follow, tailed for as long as the stream runs.
-For a YouTube recording the same track is replayed against the playback position, which means
-chat scrolls in step with the video and seeking backwards works. Chat state follows the file
-rather than the last key press, so opening something with no chat at all says so once and does
-not leave a dead panel behind.
-
-Emotes are real images, not names in brackets. Twitch native emotes plus 7TV, BTTV and FFZ,
-YouTube channel emoji, and plain unicode emoji are all downloaded and decoded to raw frames by
-`bin/mpv-chat-emote`, cached under the user cache folder, and composited into the text by
-column. Animated emotes animate. Every frame of one emote lives in a single file because mpv's
-overlay command takes a byte offset into a file, so showing the next frame is one command with
-a different offset and no extra reads. **F11** turns the animation off, which is there to
-measure what it costs.
-
-Two limits are worth knowing about. mpv has exactly 64 overlay slots, numbered 0 to 63, and
-one of them belongs to the thumbnail preview, so **63 emote images can be on screen at once**.
-A busy panel wants far more than that, roughly 37 lines of nine emotes each in the beside
-layout, which is why that layout collapses repeats of one emote and hands slots to the newest
-messages first. An emote wall then runs out of images at the top of the panel rather than at
-the freshest line. How many image slots **one message may claim follows the height of the
-panel**, so the over layout, being eight lines tall, allows seven and draws repeats as
-separate images, while the taller beside layout keeps six and the collapsing. Anything past
-the cap becomes a single token that reads plus and a number.
-
-The chat font is a monospace face that covers Latin and
-Japanese in one file, because emote images are positioned by counting character cells, and the
-usual monospace font silently falls back to a proportional face for Japanese, which drifts
-emotes further off centre with every character. And the panel reads the margins that ModernZ
-publishes while the controller is visible, so an emote never ends up sitting under the seek
-bar.
-
-### Japanese chat in English
-
-**Shift+F12** translates Japanese chat into English while it scrolls. It works on its own, on
-Twitch as well as on YouTube, and needs no subtitles anywhere. **F12** switches it on as well,
-since wanting Japanese speech translated but not the chat is the unlikely case, and Shift+F12
-then overrides that in either direction for the rest of the file.
-
-`bin/mpv-chat-translate` follows the same line based file the panel reads and appends
-translations to a file of its own, keyed by the line number of the message. Nothing on screen
-ever waits for the graphics card because of that. A message appears in Japanese the moment it
-is due and turns into English when its translation lands, which on a live stream happens well
-inside the delay chat is already held back by. The translator is the same model the subtitle
-feature below uses, so there is no second download and no second setup.
-
-Most messages never reach the model at all. A message with no Japanese letter in it is left
-alone, which is most of a western chat, and a face built out of half width katakana stays a
-face. Around twenty clipped chat words that the model transliterates rather than translates
-are answered from a table instead, and an exact repeat of an earlier message comes from a
-cache. What is left is translated in batches of sixteen, measured at 286 messages a second
-against a worst case chat of 8 messages a second, and it holds around 860 MB of video memory
-while it runs. On a recording it stays 120 seconds ahead of the playback position rather than
-translating a whole stream nobody has watched yet.
-
-The video title is translated here as well, on the same key, so a video watched with Japanese
-speech left alone still carries an English title. Only one of the two features ever does that
-work. With subtitles on, their worker already has the title and this one leaves it be, which
-also keeps the chat model out of video memory until the first Japanese message actually
-arrives.
-
-Emote labels are lifted out of the text before translation and put back in place afterwards,
-so emotes, the collapsing of repeats and the image slots all behave exactly as they do
-untranslated.
-
-## Japanese to English subtitles
-
-**F12** on a Japanese YouTube video adds English subtitles that did not exist before.
-Recognition and translation both run locally on the GPU, ahead of the playback position, and
-the result arrives as an ordinary subtitle track, so the scale, delay and visibility keys all
-work on it.
-
-The title is translated as well. It is the one line that is read before the video even starts
-and no subtitle covers it, so the English title takes the place of the Japanese one in the on
-screen controls and in the window title. It costs a single line through the translator, which
-is loaded for the subtitles anyway, so it appears while the audio is still downloading, and it
-is cached beside the cues, which makes a second viewing instant. A title that is already
-English is left alone, and switching translation off puts the original back. Set
-`translate_title=no` to always keep the original.
-
-Whether a video qualifies is read from its automatic caption list, from the single key ending
-in `-orig`, which names the language YouTube's own recogniser ran in. The `language` field
-YouTube reports is not reliable. Only the original audio is downloaded, roughly 50 MB per hour,
-pinned by its format note so an automatic dub is never picked instead. Whisper `large-v3`
-recognises and Sugoi v4 translates, both on the CTranslate2 runtime.
-`bin/mpv-translate-setup` installs them once, about 7 GB of environment and models, into
-`~/.local/share/mpv-translate` and the model cache, outside this clone.
-
-Voice activity detection is off by default. It discards audio before the recogniser sees it and
-takes real speech with it on anything noisy. Turning it on with `vad=yes` roughly halves the
-work and is worth it for clean, quiet recordings.
-
-Work is picked by need rather than in file order. Audio the viewer is sitting on with no
-subtitles is transcribed at full speed, everything else is paced by a duty cycle so the video
-shaders keep the GPU they need, and the `fill` setting decides how far it goes.
-
-* **whole** transcribes the entire video, so seeking anywhere is instant afterwards and the
-  cached audio is dropped once the last second is covered. The card is busy for a few minutes.
-* **ahead** keeps a window in front of the playhead and then idles, which leaves the card
-  almost free, at the cost of a short wait when you seek somewhere never visited.
-
-An optional glossary substitutes names and coined terms into the source before translation, one
-tab separated pair per line.
-
-```
-mpv/translate-glossary.tsv
-```
-
-It is not tracked and a missing file simply means no glossary. Only proper nouns and coined
-words belong in it, since the substitution is blind and an entry for an ordinary word would
-corrupt every sentence that uses the word normally.
-
-Cues live in `~/.local/state/mpv/translate-subs` and are tiny. The audio beside them is not, so
-audio is bounded by age and by total size and dropped once a video has been watched through,
-while cues are never dropped. Progress is published as a user data property that the cheat
-sheet reads, so **h** reports what the worker is doing, how much time of subtitles sits in
-front of the playhead, and how much of the video is done.
-
-## The upscaler and its pixel budget
-
-An ArtCNN pass costs a fixed amount of work per source pixel and has to be paid once per
-frame, so what decides whether the heavy model keeps up is the source pixel rate, meaning
-width times height times frame rate. This is why 1080p60 struggles while 1080p30 is
-comfortable. Same pixels, twice the rate.
-
-`mpv.conf` therefore loads the heavy `C4F32_DS` model by default and carries a profile that
-switches to the lighter `C4F16_DS` for any file above 85 megapixels per second. Everything at
-or above 1080p50 and 1440p24 lands on the light model.
-
-**That threshold is measured, not chosen.** On my card 1080p60 is 124 megapixels per second
-and renders at roughly 53 of 60 frames, so the heavy model's sustained ceiling sits near 110.
-The threshold is set well below that to leave room for debanding, the scaler passes and HDR
-tone mapping, none of which were part of that measurement. To find your own number, play a
-1080p60 video with the heavy model forced, watch the dropped frame counter in mpv's own
-statistics, and work down from the pixel rate at which it stops dropping. Then change the
-number in three places, the profile condition in `mpv/mpv.conf`, the labels in
-`mpv/input.conf`, and `PIXEL_RATE_LIMIT` in `mpv/scripts/keyhelp.lua`. A Lua script cannot
-read a profile condition and a profile condition cannot call Lua, so those two really are
-separate copies of the same number.
-
-Debanding is on with a low grain setting. It repairs a completely different artefact than the
-shader does. The shader rebuilds edges and detail, debanding fixes the stepped gradients that
-compression leaves in skies and dark scenes, and 8 bit banding survives even a high bitrate
-stream once the picture is dark enough.
-
-## Key bindings
-
-![Key binding cheat sheet](docs/screenshots/keybindings.jpg)
-
-**h** opens the cheat sheet above. It is drawn by `scripts/keyhelp.lua`, which **parses
-`input.conf` at startup**, so a binding added there appears in the sheet by itself. Giving it
-a friendly label is a one line addition to a table in the script. Pressing **?**, which is
-mpv's own default binding and not something this config sets, still brings up the statistics
-script's complete raw list of every binding that exists.
-
-The sheet reports rather than asserts. Each shader row carries a live marker showing which
-model is actually loaded right now, because the automatic switch means the default key is not
-what is playing on most files, and a footnote states the current file's pixel rate against the
-threshold. Both update while the sheet is open.
-
-| Key | What it does |
-|---|---|
-| F1 | Heavy shader, sharpening variant. The base default |
-| F2 | Light shader, sharpening variant. What the automatic switch picks |
-| F6 | Heavy shader, softening variant |
-| F7 | No neural shader at all, conventional scaling only. The honest baseline |
-| F8 | Toggle the luma scaler between two variants, independent of the shader keys |
-| F5 | Toggle debanding for a comparison |
-| F3 | Print format, codec, resolution, frame rate, bitrate and active shader |
-| F4 | Loop the current file |
-| F9 | Queue mode |
-| F10 | Chat overlay, off then beside then over |
-| F11 | Emote animation |
-| F12 | Japanese to English subtitles |
-| Shift+F12 | Japanese chat to English |
-| h | This cheat sheet |
-| Up and Down | Volume, replacing the default long seek |
-| Plus and Minus | Playback speed, also on the numeric keypad |
-| Backspace | Back to normal speed |
-| Keypad 0 | Back to the start of the video |
-
-Escape is deliberately disabled so that a stray press cannot drop the player out of
-fullscreen.
-
-The right hand column of the sheet is mpv's own keys rather than anything this config sets,
-kept there so that one screen answers every question. It covers the seek keys, mute,
-fullscreen, quitting with and without saving the position, the playlist keys, volume on the
-mouse wheel, pause on a right click, since the controller has no pause button any more, and
-**b** for turning SponsorBlock skipping off for the video that is playing.
-
-## Queue mode
-
-**F9**, from `scripts/queue_mode.lua`. Off, which is the default, a click in the browser
-replaces whatever is playing. On, a click appends to the playlist instead and the playlist
-loops forever, so clicks stack up into a queue rather than interrupting each other.
-
-This is what I use for music. Collect however many videos I feel like, let them run, and have
-the whole thing start over at the end instead of stopping.
-
-The state lives in a flag file rather than inside the player, for two reasons. The browser
-wrapper has to know the mode before it decides how to hand a URL over, and a player started
-fresh while queue mode is on has to come up already looping. Turning queue mode on also clears
-a single file loop if one is active, because looping one file forever means the playlist never
-advances and queue mode would silently do nothing.
-
-## Per video volume
-
-`scripts/volume_per_file.lua` remembers the volume of every video separately. mpv looks like
-it already does this but it does not, for two measured reasons.
-
-A file that reaches its end stores nothing at all. mpv writes a resume file only for whatever
-was playing when it quit, and a finished file is considered done and dropped, so a music video
-never kept its volume. And volume is a global property, so it leaks into whatever plays next.
-Both were measured. A two entry playlist advancing on its own started the second file at the
-first file's setting, and a browser handoff mid playback did the same.
-
-One file per video is stored under the XDG state folder, holding nothing but the number. The
-names are readable with a short hash suffix, so an entry can be found and deleted by hand and
-that video then forgets. Volume is removed from mpv's own resume options so that there is one
-writer instead of two, while values already written by the old behaviour are still picked up
-once as a free migration. Writes are coalesced, because one scroll of the wheel produces a
-property event per tick.
-
-## SponsorBlock
-
-`scripts/sponsorblock.lua` asks the SponsorBlock database for the segments of a YouTube video
-as soon as the file starts, which is usually answered before the video itself has loaded.
-Sponsor segments and intros are skipped on their own. Self promotion, interaction reminders,
-outros, previews and filler are only marked, as dark red stretches on the seek bar, and
-hovering one names its category next to the time. A right click on the seek bar jumps to the
-nearest chapter start or segment edge, which is how a marked segment gets skipped by hand. An
-intro that runs straight into a sponsor is skipped in one seek instead of two.
-
-**b** turns the automatic skipping off for the video that is playing, for the rare entry whose
-intro reaches too far. The next video starts with it on again.
-
-The database is asked by the first four characters of the SHA256 hash of the video id, the
-same way the browser extension does it, and the answer is filtered locally, so the server
-never learns which video is playing. What the script finds is published in
-`user-data/sponsorblock/segments`, which is where the patched ModernZ reads it from.
-
-## Smaller scripts
-
-* **`scripts/restart-short-videos.lua`** turns off resume for anything shorter than ten
-  minutes. Resume is on for everything else. A music video should start at the beginning.
-* **`scripts/ytdl_fail_notice.lua`** turns a `yt-dlp` failure into a readable message on screen
-  and a desktop notification instead of the player exiting. It exists for one specific case.
-  YouTube keeps a finished livestream as thousands of two second chunks for a while, `yt-dlp`'s
-  metadata for such a video is then larger than the 64 MiB that mpv is willing to read from a
-  subprocess, the JSON arrives truncated and mpv gives up and quits. The script recognises the
-  truncation, explains that YouTube converts these into normal videos on its own after a
-  while, and keeps the player alive on the file that was working.
-* **`scripts/modernz-audio-button-auto.lua`** hides the audio track button on the controller
-  unless the file actually has more than one audio track. ModernZ rereads its options at
-  runtime, so the button appears and the controller relayouts live.
-
-## YouTube Premium and the browser profile
-
-Authentication is read live out of a browser profile on every play, which is the part of this
-config I would recommend to anyone.
-
-`ytdl-raw-options` points `yt-dlp` at a symlink named `browser-profile` inside the mpv config
-folder, and that symlink points at the profile of whichever browser I actually browse in.
-YouTube authentication is a long lived cookie plus a short lived token that the server rotates
-every few hours. An exported cookie file freezes that token, so it is rejected within hours
-and the player looks logged out. Reading the profile database directly picks up whatever the
-browser last refreshed, so it never expires while the browser stays logged in. Switching
-browsers is one `ln -sfn` and `mpv.conf` never changes. It only works with Firefox and its
-forks, because their cookie database is a plain unencrypted file that can be copied while the
-browser runs.
-
-The symlink has to point at the profile that is genuinely being used. Pointing it at an
-abandoned profile does not fail, it works for days and then rots, because nothing refreshes
-the rotating token in a profile nobody browses in.
-
-`mark-watched` is set alongside it, which makes `yt-dlp` send the playback ping that puts the
-video into the YouTube watch history. Cookies alone do not do that, because history is
-normally written by the web player's own beacons which a command line tool never sends, and
-without it the recommendations on the website slowly stop reflecting what was actually
-watched. The flag marks a video as seen at load time and carries no watch position.
-
-`ytdl-format` asks for the Premium enhanced bitrate track by its format note across every
-codec, and falls back to the best normal track. Without a Premium account it simply always
-takes the fallback.
-
-## The rest of mpv.conf
-
-The renderer is `gpu-next` on Vulkan with hardware decoding left on automatic, because pinning
-it to Vulkan silently failed for AV1 and fell back to sixteen software threads at 4K.
-Tone mapping is left to handle HDR natively with no fake expansion of SDR content, and
-saturation is nudged up slightly for how HDR looks in this Wayland session.
-
-The demuxer cache is set to 3 GiB in each direction. The backward half is the one that
-matters, because that is what gets thrown away when seeking back or looping, and throwing it
-away means downloading the video again. **That is an huge amount for a video player** and I
-know it. I have enough memory that paying for it costs me nothing while jumping
-around a long video stays instant. If your memory is more contested, turn both numbers down.
-The defaults are 150 MiB forward and 50 MiB back, and anything in between works fine.
-
-Resume files record the source URL as a comment inside themselves, because they are named
-after a hash and are otherwise impossible to tell apart. Four options are excluded from resume,
-each on its own line, which matters more than it looks. Given a comma separated list mpv looks
-the whole string up as one option name, finds nothing, and silently removes nothing at all.
-
-The window opens fullscreen on the HDMI output the television is connected to.
-
-## Installing
+My everyday video player for local files, YouTube and Twitch. A click on "Play in mpv" in the
+browser sends the video to one running player, which upscales it with a neural network shader
+on the GPU, shows live chat next to or over the picture, and can turn Japanese speech into
+English subtitles without anything leaving the machine.
+
+In my setup most videos come from [Weave](https://github.com/Tobias2909/Weave), my YouTube and
+Twitch client, which sends them through the same ff2mpv wrapper as the browser and marks them
+watched by listening to the player, and everything here works the same without it.
+
+It is tuned for one RTX 4080 SUPER and one 4K television, so take the scripts and ignore the
+tuning.
+
+![Player, chat beside the video, chat over the video and the key cheat sheet](docs/screenshots/overview.jpg)
+
+## Features
+
+* **AI upscaling** with ArtCNN. A heavy model by default, switched to a light one above 85
+  megapixels per second so 1080p60 never drops frames
+* **Browser handoff** through ff2mpv. A click swaps the video in the running player or starts a
+  new one
+* **YouTube links cleaned** so resume always finds a video again, whole playlists expanded,
+  radio mixes cut at 50 entries
+* **Twitch through streamlink** with the ttvlol plugin, so stitched in ads are gone, titled with
+  channel, stream title and category
+* **Live chat** from Twitch and YouTube, also replayed in step with a YouTube recording. Shown
+  beside the video or in a box that you drag, size and lock with the mouse (F10)
+* **Real emotes** from Twitch, 7TV, BTTV, FFZ and YouTube, animated
+* **Japanese to English subtitles** recognised and translated locally on the GPU, ahead of the
+  playback position (F12)
+* **Japanese chat in English** while it scrolls (Shift+F12). Video titles are translated too
+* **SponsorBlock** skips sponsors and intros and marks every other segment on the seek bar. The
+  server never learns which video is playing
+* **Per video volume** remembered for every video, and a fresh player starts at the last volume
+* **Queue mode** (F9) makes browser clicks stack up into a looping playlist instead of
+  replacing the video
+* **Key cheat sheet** on h, read from `input.conf`, showing which shader is really active
+* **YouTube Premium** enhanced bitrate, with cookies read live from the browser profile so the
+  login never expires, and watched videos land in the YouTube history
+* **Instant seek bar previews** in the ModernZ controller, made ahead of time from the
+  cache and from YouTube storyboards, so hovering never waits for a download
+* Videos under ten minutes always start from the beginning
+* A failed `yt-dlp` load is explained on screen instead of closing the player
+* Debanding, `gpu-next` on Vulkan and HDR passthrough
+
+## Install
+
+Needs `mpv`, `yt-dlp`, `ffmpeg`, `curl`, `socat`, `jq`, `python3`, `streamlink` with
+`streamlink-ttvlol`, `ff2mpv-rust` and the ff2mpv extension for
+[Firefox](https://addons.mozilla.org/firefox/addon/ff2mpv/) or
+[Chrome](https://chromewebstore.google.com/detail/ff2mpv/ephjcajbkgplkjmelpglennepbpmdpjg).
 
 ```
 git clone https://github.com/Tobias2909/mpv-config ~/mpv-config
-cd ~/mpv-config
 ln -s ~/mpv-config/mpv ~/.config/mpv
 ln -s ~/mpv-config/bin/* ~/.local/bin/
 ln -s ~/mpv-config/config/ff2mpv-rust.json ~/.config/ff2mpv-rust.json
 ```
 
-Then fetch ArtCNN and ModernZ as described at the top, create the browser profile symlink, and
-edit the three lines listed below. Run `bin/mpv-translate-setup` as well if you want the
-Japanese subtitle feature.
+Then
 
-Symlinks rather than copies, because that is how I run it myself. This clone **is** my live
-configuration, so editing a script and committing it are the same act and the two can never
-drift apart. That is also why the ignore file names the shaders, the controller and the
-browser profile symlink. They live inside the clone but are either downloads or specific to
-one machine, so none of them belong in a commit.
+1. Put the six files from the `GLSL` folder of [ArtCNN](https://github.com/Artoriuz/ArtCNN)
+   into `mpv/shaders/`.
+2. Get [ModernZ](https://github.com/Samillion/ModernZ) 0.3.3. Put `modernz.lua` into
+   `mpv/scripts/`, its icon font into `mpv/fonts/` and `modernz-locale.json` into
+   `mpv/script-opts/`, then apply the patch.
+   ```
+   patch -p1 -d ~/mpv-config/mpv/scripts < ~/mpv-config/vendor/modernz.patch
+   ```
+3. Point the cookie link at the profile of the Firefox based browser you are logged in with.
+   ```
+   ln -sfn "/path/to/your/firefox/profile" ~/.config/mpv/browser-profile
+   ```
+4. Change the lines that name my machine. The cookie path has to stay absolute because
+   `yt-dlp` does not expand a tilde.
+   ```
+   mpv/mpv.conf                 ytdl-raw-options, screen-name, fs-screen-name
+   config/ff2mpv-rust.json      player_command
+   ```
+5. On a weaker GPU lower `85000000` in `mpv/mpv.conf` and `PIXEL_RATE_LIMIT` in
+   `mpv/scripts/keyhelp.lua`.
+6. Optional, for the Japanese features. Run `bin/mpv-translate-setup` once. It downloads about
+   7 GB into `~/.local/share/mpv-translate` and the model cache.
 
-Three things in `mpv/mpv.conf` name my machine and need changing.
+## License
 
-```
-ytdl-raw-options=cookies-from-browser=firefox:/home/<you>/.config/mpv/browser-profile
-screen-name=HDMI-A-1
-fs-screen-name=HDMI-A-1
-```
-
-The cookie path has to be absolute. `yt-dlp` hands that string on without expanding a tilde and
-without looking at your home folder, so there is no portable way to write it. The two screen
-options can simply be deleted if you do not want a fixed screen. The same applies to
-`player_command` in `config/ff2mpv-rust.json`.
-
-The `browser-profile` symlink itself is not in the repo, since it points into a browser
-profile that only exists on my machine. Create it yourself.
-
-```
-ln -sfn "/path/to/your/firefox/profile" ~/.config/mpv/browser-profile
-```
-
-## What is worth stealing
-
-If you are here for parts rather than the whole thing, these work anywhere with no changes.
-
-* `scripts/chat_overlay.lua` with `bin/mpv-chat-source` and `bin/mpv-chat-emote`
-* `scripts/volume_per_file.lua`
-* `scripts/ytdl_fail_notice.lua`
-* `scripts/restart-short-videos.lua`
-* `scripts/modernz-audio-button-auto.lua`
-
-These are useful as a pattern but are tied to how I have things set up.
-
-* `scripts/keyhelp.lua`, which adapts to your `input.conf` on its own but names my shaders
-* `scripts/sponsorblock.lua`, which skips on its own but needs the patched ModernZ to draw
-  anything
-* `bin/mpv-ff2mpv-single.sh` and `bin/mpv-queue-toggle` with `scripts/queue_mode.lua`
-
-And these are measurements of my hardware, not settings.
-
-* The 85 megapixels per second threshold and everything around it
-* The colour, HDR and screen options in `mpv.conf`
-
-## Credits
-
-ArtCNN by Joao Chrisostomo and Kacper Michajłow, MIT licensed. ModernZ by Samillion, which
-descends from mpv's own on screen controller and is LGPL 2.1 licensed, included here only as a
-patch against its source. ff2mpv by William Woodruff. streamlink and the TTV LOL plugin.
-`yt-dlp`. Segment data from the SponsorBlock project by Ajay Ramachandran. Everything written by
-me in this repository is MIT licensed, see `LICENSE`.
+MIT, see `LICENSE`. ArtCNN (MIT) and ModernZ (LGPL 2.1) are not included, ModernZ only as a
+patch against its source. Segment data comes from the SponsorBlock project.
