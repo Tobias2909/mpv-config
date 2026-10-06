@@ -160,11 +160,46 @@ end
 
 ---------------------------------------------------------------- cache slices
 
-local function add_picture(t, file, off, min_gap)
+local function add_picture(t, min_gap)
     local i = find(t)
     if i and t - pics[i].t < min_gap then return end
     if pics[(i or 0) + 1] and pics[(i or 0) + 1].t - t < min_gap then return end
-    table.insert(pics, (i or 0) + 1, { t = t, file = file, off = off })
+    local p = { t = t }
+    table.insert(pics, (i or 0) + 1, p)
+    return p
+end
+
+local function forget(list)
+    local gone = {}
+    for _, p in ipairs(list) do gone[p] = true end
+    local j = 0
+    for i = 1, #pics do
+        if not gone[pics[i]] then j = j + 1; pics[j] = pics[i] end
+    end
+    for i = #pics, j + 1, -1 do pics[i] = nil end
+end
+
+-- Copies the kept pictures out of the decoder's output into a file of their
+-- own. ram_mb only bounds the RAM if a skipped picture is really gone, and
+-- every chained slice repeats its anchor keyframe, which is always skipped.
+local function store(raw, kept, size)
+    if #kept == 0 then return true end
+    slice_n = slice_n + 1
+    local file = ("%s/k%05d.bgra"):format(dir, slice_n)
+    local src = io.open(raw, "rb")
+    local dst = src and io.open(file, "wb")
+    local ok = dst ~= nil
+    for i, p in ipairs(kept) do
+        if not ok then break end
+        src:seek("set", p.src)
+        local data = src:read(size)
+        ok = data ~= nil and #data == size and dst:write(data) ~= nil
+        p.file, p.off, p.src = file, (i - 1) * size, nil
+    end
+    if src then src:close() end
+    if dst then ok = dst:close() and ok end
+    if not ok then os.remove(file) end
+    return ok
 end
 
 local function merge_chains()
@@ -250,12 +285,13 @@ local function filters()
                  .. "format=bgra,showinfo"
 end
 
-local function decoded(job, my_gen, out, res)
+local function decoded(job, my_gen, raw, res)
     if my_gen ~= gen then return end
     local times = {}
     for t in (res.stderr or ""):gmatch("pts_time:%s*([%-%d%.]+)") do times[#times + 1] = tonumber(t) end
-    local info = utils.file_info(out)
-    local n = info and math.floor(info.size / (W * H * 4)) or 0
+    local size = W * H * 4
+    local info = utils.file_info(raw)
+    local n = info and math.floor(info.size / size) or 0
     -- the frame count comes from both sides, a mismatch means the slice
     -- cannot be mapped to video time and its pictures would be wrong
     local reached = job.b >= job.range_end - 0.01
@@ -268,10 +304,19 @@ local function decoded(job, my_gen, out, res)
     -- A chained slice starts at the anchor keyframe, whose time is known. The
     -- first slice of a range has its timestamps rebased to the range start.
     local offset = job.chain and (job.chain.b - times[1]) or job.origin
-    local most = o.ram_mb * 1e6 / (W * H * 4)
+    local most = o.ram_mb * 1e6 / size
     local min_gap = math.max(1, (duration or 0) / most)
+    local kept = {}
     for k, t in ipairs(times) do
-        add_picture(offset + t, out, (k - 1) * W * H * 4, min_gap)
+        local p = add_picture(offset + t, min_gap)
+        if p then p.src = (k - 1) * size; kept[#kept + 1] = p end
+    end
+    if not store(raw, kept, size) then
+        forget(kept)
+        failures = failures + 1
+        msg.verbose("could not store the pictures of a slice")
+        if job.chain then job.chain.last_b = job.b end
+        return
     end
     local last = offset + times[#times]
     local c = job.chain
@@ -293,9 +338,8 @@ end
 local function cut(job)
     busy = true
     local my_gen = gen
-    slice_n = slice_n + 1
     local slice = dir .. "/slice.mkv"
-    local out = ("%s/k%05d.bgra"):format(dir, slice_n)
+    local raw = dir .. "/slice.bgra"
     run({ "dump-cache", ("%.3f"):format(job.a), ("%.3f"):format(job.b), slice }, function(ok)
         if my_gen ~= gen then return end
         if not ok then
@@ -308,12 +352,13 @@ local function cut(job)
               args = { "nice", "-n", "10", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
                        "-threads", "2", "-skip_frame", "nokey", "-i", slice, "-map", "0:v:0",
                        "-vf", filters(), "-fps_mode", "passthrough",
-                       "-f", "rawvideo", "-pix_fmt", "bgra", "-y", out } },
+                       "-f", "rawvideo", "-pix_fmt", "bgra", "-y", raw } },
             function(ok2, res)
                 if my_gen ~= gen then return end
                 busy = false
-                if ok2 and res then decoded(job, my_gen, out, res) else failures = failures + 1 end
+                if ok2 and res then decoded(job, my_gen, raw, res) else failures = failures + 1 end
                 os.remove(slice)
+                os.remove(raw)
             end)
     end)
 end
