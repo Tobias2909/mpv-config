@@ -82,11 +82,11 @@ local EMOTE_COLS_MAX = 12
 local ANIM        = true      -- master switch, toggled live by toggle-anim
 local ANIM_FPS    = 20        -- overlay update rate, NOT the emote's own fps
 local ANIM_MAX                -- most animated at once; assigned from OV_IDS
--- overlay-add ids are 0..63; thumbfast owns 42 (/etc/mpv/scripts/thumbfast.lua).
+-- overlay-add ids are 0..63; the seek bar preview owns 42 (scripts/seek_preview.lua).
 -- Every other id is ours, so 63 images can be on screen at once. That is still
 -- far short of the worst case (37 lines x 9 emotes = 333 in "beside"), which is
 -- why runs are collapsed, messages are capped, and allocation runs newest-first.
-local THUMBFAST_ID = 42
+local PREVIEW_ID = 42
 -- Image slots one message may claim in the FULL-HEIGHT layout; the rest
 -- collapse into a "+N" token. "over" raises this and drops the run-collapse
 -- entirely -- see the cap/merge pair in render(), which derives both from the
@@ -1186,9 +1186,9 @@ local CACHE_DIR = (os.getenv("XDG_CACHE_HOME")
                    or ((os.getenv("HOME") or "") .. "/.cache"))
                   .. "/mpv-chat-emotes"
 
-local OV_IDS = {}             -- usable overlay ids, thumbfast's excluded
+local OV_IDS = {}             -- usable overlay ids, the preview's excluded
 for i = 0, 63 do
-    if i ~= THUMBFAST_ID then OV_IDS[#OV_IDS + 1] = i end
+    if i ~= PREVIEW_ID then OV_IDS[#OV_IDS + 1] = i end
 end
 -- Everything that can be on screen animates; see the ANIM block for why the
 -- old fixed cap was 4x lower than it needed to be.

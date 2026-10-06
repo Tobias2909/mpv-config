@@ -1,6 +1,17 @@
 --- a/modernz.lua
 +++ b/modernz.lua
-@@ -628,6 +628,7 @@
+@@ -507,6 +507,10 @@
+     return false
+ end
+ 
++-- local patch: previews come from scripts/seek_preview.lua, which speaks
++-- thumbfast's protocol under its own name
++local PREVIEW = "seek_preview"
++
+ local thumbfast = {
+     width = 0,
+     height = 0,
+@@ -628,6 +632,7 @@
      keeponpause_active = false,             -- keeponpause bottombar active state
      duration = nil,                         -- current file duration
      chapter_list = {},                      -- sorted by time
@@ -8,7 +19,7 @@
      chapter = -1,                           -- current chapter index
      visibility_modes = {},                  -- visibility_modes to cycle through
      eof_reached = false,
-@@ -1449,6 +1450,41 @@
+@@ -1449,6 +1454,41 @@
      elem_ass:rect_cw(ax, slider_lo.gap, bx, elem_geo.h - slider_lo.gap)
  end
  
@@ -50,7 +61,7 @@
  local function draw_seekbar_nibbles(element, elem_ass)
      local slider_lo = element.layout.slider
      local elem_geo = element.layout.geometry
-@@ -1650,6 +1686,7 @@
+@@ -1650,6 +1690,7 @@
                  draw_seekbar_progress(element, elem_ass)
                  draw_seekbar_ranges(element, elem_ass, handle_x, handle_radius)
                  draw_ab_loop_range(element, elem_ass)
@@ -58,7 +69,7 @@
                  draw_seekbar_handle(element, elem_ass, handle_x, handle_radius, anim_override, is_active) -- draw handle on top of progress
  
                  elem_ass:draw_stop()
-@@ -1665,6 +1702,11 @@
+@@ -1665,6 +1706,11 @@
                      if mouse_hit(element) or force_seek_tooltip then
                          local sliderpos = get_slider_value(element)
                          local tooltiplabel = element.slider.tooltipF(sliderpos)
@@ -70,7 +81,25 @@
                          local an = slider_lo.tooltip_an
                          local ty
                          if an == 2 then
-@@ -2539,11 +2581,9 @@
+@@ -1745,7 +1791,7 @@
+                                 elem_ass:round_rect_cw(-thumb_pad * r_w, -thumb_pad * r_h, (thumbfast.width + thumb_pad) * r_w, (thumbfast.height + thumb_pad) * r_h, thumb_radius)
+                                 elem_ass:draw_stop()
+ 
+-                                mp.commandv("script-message-to", "thumbfast", "thumb", hover_sec, thumb_x, math.floor(thumb_y_px / r_h + 0.5))
++                                mp.commandv("script-message-to", PREVIEW, "thumb", hover_sec, thumb_x, math.floor(thumb_y_px / r_h + 0.5))
+                             end
+ 
+                             -- Keep tooltips anchored to the thumbnail center even at window edges
+@@ -1763,7 +1809,7 @@
+ 
+                         draw_tooltip(elem_ass, tx, ty, tooltip_width, slider_lo.tooltip_style, tooltiplabel, slider_lo.alpha)
+                     elseif element.thumbnailable and thumbfast.available then
+-                        mp.commandv("script-message-to", "thumbfast", "clear")
++                        mp.commandv("script-message-to", PREVIEW, "clear")
+                     end
+                 end
+             end
+@@ -2539,11 +2585,9 @@
          end
      end
  
@@ -85,7 +114,7 @@
  
      local pl_count = state.playlist_count
      local pl_pos = state.playlist_pos_1
-@@ -3560,7 +3600,24 @@
+@@ -3560,7 +3604,24 @@
              end
          end
  
@@ -111,7 +140,16 @@
              mp.set_property("chapter", chapter - 1)
          end
      end
-@@ -4154,6 +4211,11 @@
+@@ -3659,7 +3720,7 @@
+ local function hide_osc()
+     -- clear any pending thumbnail before hiding
+     if thumbfast.width ~= 0 and thumbfast.height ~= 0 then
+-        mp.commandv("script-message-to", "thumbfast", "clear")
++        mp.commandv("script-message-to", PREVIEW, "clear")
+     end
+     -- clear input area immediately so clicks pass through while the bar is
+     -- hidden, rather than waiting for the next render tick to do it
+@@ -4154,6 +4215,11 @@
      table.sort(state.chapter_list, function(a, b) return a.time < b.time end)
      request_init()
  end)
@@ -123,3 +161,21 @@
  observe_cached("duration", function ()
      if user_opts.automatickeyframemode then
          user_opts.seekbarkeyframes = (state.duration or 0) > user_opts.automatickeyframelimit
+@@ -4188,7 +4254,7 @@
+     if val and user_opts.visibility == "auto" and not user_opts.showonselect and not state.keeponpause_active then
+         -- clear pending thumbnail
+         if thumbfast.width ~= 0 and thumbfast.height ~= 0 then
+-            mp.commandv("script-message-to", "thumbfast", "clear")
++            mp.commandv("script-message-to", PREVIEW, "clear")
+         end
+         osc_visible(false)
+         wc_visible(false)
+@@ -4393,7 +4459,7 @@
+     request_init()
+ end)
+ mp.register_script_message("osc-idlescreen", idlescreen_visibility)
+-mp.register_script_message("thumbfast-info", function(json)
++mp.register_script_message(PREVIEW .. "-info", function(json) -- local patch
+     local data = utils.parse_json(json)
+     if type(data) ~= "table" or not data.width or not data.height then
+         msg.error("thumbfast-info: received json didn't produce a table with thumbnail information")
