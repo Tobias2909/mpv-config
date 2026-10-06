@@ -43,6 +43,15 @@
 -- HDR sources are tone mapped, since a PQ picture converted straight to RGB
 -- looks grey and washed out.
 --
+-- LIVE STREAMS. A live stream is not seekable except inside the cache, and
+-- its duration grows as it plays, so the duration is followed instead of read
+-- once. Pictures behind the cache start are dropped, since that part can no
+-- longer be reached. There is no length to spread ram_mb over, so every
+-- keyframe is kept at first (2 s apart on Twitch), and each time the pictures
+-- pass ram_mb every other one is dropped and the spacing doubles. With 3 GiB
+-- of cache each way a 0.62 MB/s stream holds 2.9 h, which ends at one
+-- picture per 8 s with 1024 MB.
+--
 -- ModernZ asks with `script-message-to seek_preview thumb <sec> <x> <y>` and
 -- `clear`, and listens for `seek_preview-info`, which is thumbfast's protocol
 -- under this script's name. Overlay id 42 is this script's, chat_overlay.lua
@@ -61,7 +70,7 @@ local o = {
     slice_mb   = 24,
     -- keyframe pictures of one video stay under this, a long file then keeps
     -- fewer of them rather than filling the RAM folder
-    ram_mb     = 512,
+    ram_mb     = 1024,
 }
 options.read_options(o, "seek_preview")
 
@@ -81,6 +90,8 @@ local dir = nil         -- this file's folder, nil while previews are off
 local W, H = 0, 0
 local tonemap = false
 local duration = nil
+local live = false      -- seekable only inside the cache
+local live_gap = 1      -- spacing of a live stream's pictures in seconds
 local pics = {}         -- keyframe pictures, sorted by t: { t, file, off }
 local chains = {}       -- stretches whose keyframes are all known: { a, b, limit, last_b, final }
 local board = nil       -- storyboard: { file, interval, count, w, h }
@@ -202,6 +213,71 @@ local function store(raw, kept, size)
     return ok
 end
 
+-- Drops pictures from pics and removes every file none of the rest uses.
+local function drop(gone)
+    local before, used, n, j = {}, {}, #pics, 0
+    for i = 1, n do
+        local p = pics[i]
+        before[p.file] = true
+        if not gone[p] then j = j + 1; pics[j] = p; used[p.file] = true end
+    end
+    for i = n, j + 1, -1 do pics[i] = nil end
+    for file in pairs(before) do
+        if not used[file] then os.remove(file) end
+    end
+end
+
+-- A live stream cannot seek behind its cache, so the pictures there go. The
+-- newest one at or before the cache start still shows that point and stays.
+local function prune(state)
+    local from
+    for _, r in ipairs(state["seekable-ranges"] or {}) do
+        if not from or r.start < from then from = r.start end
+    end
+    if not from or not (pics[2] and pics[2].t <= from) then return end
+    local gone, i = {}, 1
+    while pics[i + 1] and pics[i + 1].t <= from do gone[pics[i]] = true; i = i + 1 end
+    drop(gone)
+    msg.debug(("cache starts at %.1f, %d pictures left"):format(from, #pics))
+end
+
+-- Doubles a live stream's spacing and keeps only the pictures that fit it.
+-- A file that lost some is rewritten with the rest, so its RAM really comes
+-- back. Keyframes are not evenly spaced, so a gap counts from 90 % of it.
+local function thin()
+    live_gap = live_gap * 2
+    local keep, last, files, order = {}, nil, {}, {}
+    for _, p in ipairs(pics) do
+        local f = files[p.file]
+        if not f then
+            f = { all = 0, kept = {} }
+            files[p.file], order[#order + 1] = f, p.file
+        end
+        f.all = f.all + 1
+        if not last or p.t - last >= live_gap * 0.9 then
+            keep[p], last = true, p.t
+            f.kept[#f.kept + 1] = p
+        end
+    end
+    for _, file in ipairs(order) do
+        local f = files[file]
+        if #f.kept < f.all then
+            for _, p in ipairs(f.kept) do p.src = p.off end
+            if not store(file, f.kept, W * H * 4) then
+                for _, p in ipairs(f.kept) do keep[p] = nil end
+            end
+        end
+    end
+    -- a dropped picture still names its old file, so drop() removes that
+    -- file once the kept ones have moved out of it
+    local gone = {}
+    for _, p in ipairs(pics) do
+        if not keep[p] then gone[p] = true end
+    end
+    drop(gone)
+    msg.debug(("one picture per %d s, %d pictures"):format(live_gap, #pics))
+end
+
 local function merge_chains()
     table.sort(chains, function(x, y) return x.a < y.a end)
     local i = 1
@@ -248,6 +324,10 @@ local function next_slice(state)
     for _, r in ipairs(order) do
         local r_end = r["end"]
         local at_end = duration and r_end >= duration - 0.5
+        -- a live stream's duration is its cache end, so it only counts once
+        -- the demuxer stopped reading, at the stream end or with a full
+        -- cache, else a slice would be cut for every 2 s segment
+        if live then at_end = at_end and state.idle end
         local c = covering(r.start + 0.05)
         -- walk along chains that meet, to the last keyframe known in this range
         while c do
@@ -260,13 +340,18 @@ local function next_slice(state)
             -- one cut at the cache front would find nothing new. While the
             -- range grows only whole spans are cut, and a span that held no
             -- keyframe after the anchor is retried longer.
+            --
+            -- A known keyframe time can be a few ms early, as on Twitch, and
+            -- a slice cut from just after an early one starts a whole
+            -- keyframe before it, which puts every picture of that slice one
+            -- keyframe late. 50 ms past it is safe.
             local b = c.b + span
             if c.last_b and c.last_b >= b then b = c.last_b + span end
             if at_end and not c.final and c.b < r_end - 0.1 then
-                return { chain = c, a = c.b + 0.001, b = math.min(b, r_end),
+                return { chain = c, a = c.b + 0.05, b = math.min(b, r_end),
                          range_end = r_end, at_end = true }
             elseif not at_end and b <= r_end then
-                return { chain = c, a = c.b + 0.001, b = b, range_end = r_end }
+                return { chain = c, a = c.b + 0.05, b = b, range_end = r_end }
             end
         elseif r_end - r.start >= span or at_end then
             -- a range starts with a keyframe, so the slice starts there too
@@ -305,7 +390,7 @@ local function decoded(job, my_gen, raw, res)
     -- first slice of a range has its timestamps rebased to the range start.
     local offset = job.chain and (job.chain.b - times[1]) or job.origin
     local most = o.ram_mb * 1e6 / size
-    local min_gap = math.max(1, (duration or 0) / most)
+    local min_gap = live and live_gap * 0.9 or math.max(1, (duration or 0) / most)
     local kept = {}
     for k, t in ipairs(times) do
         local p = add_picture(offset + t, min_gap)
@@ -331,6 +416,7 @@ local function decoded(job, my_gen, raw, res)
     msg.debug(("slice %.1f to %.1f: %d keyframes, chain %.1f to %.1f, %d pictures")
               :format(job.a, job.b, #times, c.a, c.b, #pics))
     merge_chains()
+    while live and #pics > most and #pics > 1 do thin() end
     failures = 0
     draw()
 end
@@ -367,6 +453,7 @@ local function pump()
     if busy or not dir or W == 0 or failures >= 5 then return end
     local state = mp.get_property_native("demuxer-cache-state")
     if not state then return end
+    if live then prune(state) end
     local job = next_slice(state)
     if job then cut(job) end
 end
@@ -464,7 +551,7 @@ local function stop()
     if pump_timer then pump_timer:kill() end
     if shown then mp.commandv("overlay-remove", OVERLAY_ID) end
     remove_dir(dir)
-    dir, W, H, tonemap, duration = nil, 0, 0, false, nil
+    dir, W, H, tonemap, duration, live, live_gap = nil, 0, 0, false, nil, false, 1
     pics, chains, board, busy, failures, slice_n, shown = {}, {}, nil, false, 0, 0, nil
     loaded = false
     publish(true)
@@ -484,11 +571,14 @@ local function start()
         W, H = math.floor(o.max_height * aspect / 2 + 0.5) * 2, o.max_height
     end
     tonemap = params.gamma == "pq" or params.gamma == "hlg"
+    live = mp.get_property_native("seekable") == false
     dir = PID_DIR .. "/" .. gen
     local res = sh({ "mkdir", "-p", dir })
     if res.status ~= 0 then dir = nil return end
     publish(false)
-    storyboard()
+    -- a live stream's times start where playback started, not where the
+    -- stream did, so no storyboard would line up
+    if not live then storyboard() end
     if not pump_timer then
         pump_timer = mp.add_periodic_timer(0.1, pump)
     else
@@ -531,6 +621,16 @@ mp.register_event("file-loaded", function()
     start()
 end)
 mp.observe_property("video-params", "native", start)
+-- A live stream's duration grows while it plays. A chain that had reached the
+-- old end is open again, else the previews would stop there.
+mp.observe_property("duration", "number", function(_, d)
+    if not dir then return start() end
+    if not d then return end
+    duration = d
+    for _, c in ipairs(chains) do
+        if c.final and d > c.limit + 0.5 then c.final = false end
+    end
+end)
 
 sweep()
 publish(true)
