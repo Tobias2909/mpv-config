@@ -328,7 +328,9 @@ local function next_slice(state)
         -- the demuxer stopped reading, at the stream end or with a full
         -- cache, else a slice would be cut for every 2 s segment
         if live then at_end = at_end and state.idle end
-        local c = covering(r.start + 0.05)
+        -- at the range start itself, a chain of one keyframe ends right there
+        -- and must still be found, else its first slice is cut forever
+        local c = covering(r.start)
         -- walk along chains that meet, to the last keyframe known in this range
         while c do
             local nxt = covering(c.b + 0.05)
