@@ -61,6 +61,12 @@ local mp      = require 'mp'
 local msg     = require 'mp.msg'
 local utils   = require 'mp.utils'
 local options = require 'mp.options'
+-- mpv's `subprocess` forks the whole player, which stalls playback for about
+-- 100 ms once the cache holds gigabytes, so ffmpeg and curl start through
+-- posix_spawn instead, see script-modules/spawn.lua
+package.path = mp.command_native({ "expand-path", "~~/script-modules/?.lua" })
+               .. ";" .. package.path
+local spawn   = require 'spawn'
 
 local o = {
     max_width  = 480,
@@ -99,6 +105,8 @@ local busy = false      -- a slice is being dumped or decoded
 local failures = 0
 local slice_n = 0
 local jobs = {}         -- running async commands, aborted when the file ends
+local kids = {}         -- running helper programs, killed when the file ends
+local kid_n = 0
 local hover = nil       -- last thumb request: { t, x, y }
 local shown = nil       -- what is on screen, so a repeated request costs nothing
 local pump_timer = nil
@@ -114,9 +122,26 @@ local function run(cmd, cb)
     return id
 end
 
+-- Runs a helper program and waits for it, returns its exit code.
 local function sh(args)
-    return mp.command_native({ name = "subprocess", args = args, playback_only = false,
-                               capture_stdout = true, capture_stderr = true })
+    return spawn.wait(args)
+end
+
+-- Starts a helper program. done(status, stderr) gets its exit code, -1 if it
+-- did not start, and what it wrote to stderr.
+local function launch(args, done)
+    kid_n = kid_n + 1
+    local err = ("%s/stderr%d.txt"):format(dir, kid_n)
+    local h
+    h = spawn.start(args, { stderr = err, done = function(status)
+        kids[h] = nil
+        local f = io.open(err, "rb")
+        local text = f and f:read("*a") or ""
+        if f then f:close() end
+        os.remove(err)
+        done(status, text)
+    end })
+    if h then kids[h] = true else done(-1, "") end
 end
 
 local function publish(disabled)
@@ -436,15 +461,14 @@ local function cut(job)
             if job.chain then job.chain.last_b = job.b end
             return
         end
-        run({ name = "subprocess", playback_only = false, capture_stderr = true,
-              args = { "nice", "-n", "10", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
-                       "-threads", "2", "-skip_frame", "nokey", "-i", slice, "-map", "0:v:0",
-                       "-vf", filters(), "-fps_mode", "passthrough",
-                       "-f", "rawvideo", "-pix_fmt", "bgra", "-y", raw } },
-            function(ok2, res)
+        launch({ "nice", "-n", "10", "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
+                 "-threads", "2", "-skip_frame", "nokey", "-i", slice, "-map", "0:v:0",
+                 "-vf", filters(), "-fps_mode", "passthrough",
+                 "-f", "rawvideo", "-pix_fmt", "bgra", "-y", raw },
+            function(status, stderr)
                 if my_gen ~= gen then return end
                 busy = false
-                if ok2 and res then decoded(job, my_gen, raw, res) else failures = failures + 1 end
+                decoded(job, my_gen, raw, { status = status, stderr = stderr })
                 os.remove(slice)
                 os.remove(raw)
             end)
@@ -500,7 +524,7 @@ local function storyboard()
     local bh = math.floor(bw * H / W / 2 + 0.5) * 2
     local sheets = {}
     for k = 1, #pick.fragments do sheets[k] = ("%s/sb_%04d.jpg"):format(dir, k - 1) end
-    run({ name = "subprocess", playback_only = false, capture_stderr = true, args = args }, function()
+    launch(args, function()
         if my_gen ~= gen then return end
         -- One ffmpeg per sheet. The sheets are named .jpg but arrive as WebP,
         -- and the last one is cut down to the pictures it holds, so a single
@@ -517,8 +541,7 @@ local function storyboard()
             'ffmpeg -nostdin -v error -i "$f" -vf "$vf" -f rawvideo -pix_fmt bgra - >> "$out" || exit 1; done',
             "sh", out, vf }
         for _, s in ipairs(sheets) do cmd[#cmd + 1] = s end
-        run({ name = "subprocess", playback_only = false, capture_stderr = true, args = cmd },
-            function(ok, res)
+        launch(cmd, function(status, stderr)
                 if my_gen ~= gen then return end
                 sh({ "sh", "-c", 'rm -f -- "$1"/sb_*.jpg', "sh", dir })
                 -- only whole sheets count, a sheet that broke off would shift nothing
@@ -526,8 +549,8 @@ local function storyboard()
                 local info = utils.file_info(out)
                 local per = pick.columns * pick.rows
                 local done = info and math.floor(info.size / (bw * bh * 4) / per) * per or 0
-                if not ok or res.status ~= 0 then
-                    msg.warn("storyboard stopped early: " .. tostring(res and res.stderr))
+                if status ~= 0 then
+                    msg.warn("storyboard stopped early: " .. stderr)
                 end
                 if done == 0 then return end
                 local total = math.ceil((duration or 0) * pick.fps)
@@ -549,7 +572,8 @@ end
 local function stop()
     gen = gen + 1
     for id in pairs(jobs) do mp.abort_async_command(id) end
-    jobs = {}
+    for h in pairs(kids) do spawn.kill(h) end
+    jobs, kids = {}, {}
     if pump_timer then pump_timer:kill() end
     if shown then mp.commandv("overlay-remove", OVERLAY_ID) end
     remove_dir(dir)
@@ -575,8 +599,7 @@ local function start()
     tonemap = params.gamma == "pq" or params.gamma == "hlg"
     live = mp.get_property_native("seekable") == false
     dir = PID_DIR .. "/" .. gen
-    local res = sh({ "mkdir", "-p", dir })
-    if res.status ~= 0 then dir = nil return end
+    if sh({ "mkdir", "-p", dir }) ~= 0 then dir = nil return end
     publish(false)
     -- a live stream's times start where playback started, not where the
     -- stream did, so no storyboard would line up
