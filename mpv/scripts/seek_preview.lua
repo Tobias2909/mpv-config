@@ -97,6 +97,8 @@ local W, H = 0, 0
 local tonemap = false
 local duration = nil
 local live = false      -- seekable only inside the cache
+local growing = false   -- the duration grew while playing, a stream still being recorded
+local first_duration = nil
 local live_gap = 1      -- spacing of a live stream's pictures in seconds
 local pics = {}         -- keyframe pictures, sorted by t: { t, file, off }
 local chains = {}       -- stretches whose keyframes are all known: { a, b, limit, last_b, final }
@@ -349,10 +351,13 @@ local function next_slice(state)
     for _, r in ipairs(order) do
         local r_end = r["end"]
         local at_end = duration and r_end >= duration - 0.5
-        -- a live stream's duration is its cache end, so it only counts once
-        -- the demuxer stopped reading, at the stream end or with a full
-        -- cache, else a slice would be cut for every 2 s segment
-        if live then at_end = at_end and state.idle end
+        -- A live stream's duration is its cache end, and a stream that is
+        -- still being recorded (Twitch from the stream start) grows its
+        -- duration as it plays. For both the end only counts once the stream
+        -- has ended and the reader got there. Until then the end moves one
+        -- 2 s segment at a time, with a full cache too, and each move would
+        -- cut a slice holding one new keyframe at most.
+        if live or growing then at_end = at_end and state.eof end
         -- at the range start itself, a chain of one keyframe ends right there
         -- and must still be found, else its first slice is cut forever
         local c = covering(r.start)
@@ -577,7 +582,7 @@ local function stop()
     if pump_timer then pump_timer:kill() end
     if shown then mp.commandv("overlay-remove", OVERLAY_ID) end
     remove_dir(dir)
-    dir, W, H, tonemap, duration, live, live_gap = nil, 0, 0, false, nil, false, 1
+    dir, W, H, tonemap, duration, live, growing, live_gap = nil, 0, 0, false, nil, false, false, 1
     pics, chains, board, busy, failures, slice_n, shown = {}, {}, nil, false, 0, 0, nil
     loaded = false
     publish(true)
@@ -589,6 +594,7 @@ local function start()
     if dir or not loaded or not params or not params.dw or params.dw == 0 then return end
     local track = mp.get_property_native("current-tracks/video")
     duration = mp.get_property_number("duration")
+    first_duration = duration
     if not track or track.image or track.albumart or not duration then return end
     local aspect = params.dw / params.dh
     if aspect >= o.max_width / o.max_height then
@@ -651,6 +657,7 @@ mp.observe_property("video-params", "native", start)
 mp.observe_property("duration", "number", function(_, d)
     if not dir then return start() end
     if not d then return end
+    if first_duration and d > first_duration + 1 then growing = true end
     duration = d
     for _, c in ipairs(chains) do
         if c.final and d > c.limit + 0.5 then c.final = false end
