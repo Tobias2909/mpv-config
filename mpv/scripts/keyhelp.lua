@@ -29,6 +29,12 @@ local DESC = {
     F3 = "Show stream info (codec, res, bitrate)",
     F4 = "Loop current video",
     F9 = "Queue mode: append + loop playlist",
+    ["Shift+F9"] = "POV mode: clicks add a view",
+    -- Bound by pov_sync.lua while views play, not in input.conf.
+    ["1-9"] = "That view big + its sound",
+    ["Alt+1-9"] = "Only that view's sound",
+    ["0"] = "All views the same size",
+    ["drag view"] = "Onto another one: swap the two",
     F10 = "Chat: off -> beside -> over (streams only)",
     F11 = "Chat emote animation on/off",
     F12 = "Japanese to English subtitles (YouTube)",
@@ -214,6 +220,15 @@ local STATE = {
         end
         return "off"
     end,
+    -- Published by pov_sync.lua, absent when it is not loaded.
+    ["Shift+F9"] = function()
+        local p = mp.get_property_native("user-data/pov_sync")
+        if type(p) ~= "table" then return nil end
+        local views = tonumber(p.views) or 0
+        local text = p.adding and "ON" or "off"
+        if views > 1 then text = text .. ", " .. views .. " views" end
+        return text
+    end,
 }
 
 -- Both translation features share one area, because they are one topic and
@@ -235,6 +250,7 @@ local GROUPS = {
     { "Upscaler / picture", { "F1", "F2", "F6", "F7", "F8", "F5" }, pixel_rate_note },
     { "Playback",           { "F4", "UP", "DOWN", "+", "-", "BS" } },
     { "Translation",        { "F12", "Shift+F12" }, translation_notes },
+    { "Points of view",     { "Shift+F9", "1-9", "Alt+1-9", "0", "drag view" } },
     { "Queue / loop",       { "F9" } },
     { "Info",               { "F3" } },
 }

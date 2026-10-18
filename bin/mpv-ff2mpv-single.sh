@@ -7,6 +7,7 @@
 #   playlist (mpv's ytdl_hook forces --no-playlist for those by default), then
 #   a background job jumps to the clicked video once expansion finishes.
 # - All other URLs go straight to mpv (which uses ytdl_hook → yt-dlp).
+# - In POV mode the URL joins the video playing as one more point of view.
 # - If a previous ff2mpv-spawned mpv is still alive, swap its current file
 #   for the new URL via IPC. Otherwise start a fresh mpv.
 
@@ -62,6 +63,23 @@ if [[ "$URL" =~ ^https?://([^/]+\.)?youtube\.com/watch ]]; then
         URL="https://www.youtube.com/watch?v=$CANON_V"
         [[ -n "$CANON_LIST" ]] && URL="$URL&list=$CANON_LIST"
     fi
+fi
+# -----------------------------------------------------------------------------
+
+# POV mode ---------------------------------------------------------------------
+# Shift+F9 in mpv, or ~/.local/bin/mpv-pov-toggle from a KDE global shortcut.
+# While it is on, the clicked video joins the one playing as one more point of
+# view, lined up with it by sound (pov_sync.lua), instead of replacing it. The
+# state lives in the running mpv, so it ends with that player and with the
+# video it was turned on for, and no player reads as off. Asked before the
+# Twitch block on purpose: lining up needs the address yt-dlp knows, not a
+# resolved stream. One query costs about 3 ms.
+POV="$(ipc '{"command":["get_property","user-data/pov_sync/adding"]}' | jq -r '.data // empty' 2>/dev/null)"
+if [[ "$POV" == true ]]; then
+    # The clicked video only, never the playlist it was clicked in.
+    cmd="$(jq -c -n --arg url "${URL%%&list=*}" '{command:["script-message","pov-add",$url]}')"
+    ipc "$cmd" >/dev/null
+    exit 0
 fi
 # -----------------------------------------------------------------------------
 

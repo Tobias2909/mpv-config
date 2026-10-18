@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Find where several recordings of one session line up, by their sound.
+
+Usage:
+    mpv-pov-sync [--raw KEY=VALUE ...] [--format FMT] URL URL [URL ...]
+
+Friends who play together and each upload their own view all have the voice
+chat in their sound, so the recordings can be lined up by what they share.
+The first URL is the one the player already plays. For every URL the answer
+says where it is when the first one is at zero, plus the stream URLs the
+player opens, as one JSON object on stdout:
+
+    {"videos": [{"url", "id", "title", "channel", "duration",
+                 "offset", "video", "audio", "matched", "error"}, ...]}
+
+`offset` is in seconds, position in this video = position in the first + offset.
+`matched` is false for a video whose sound matched none of the others, its
+offset is then 0 and means nothing. Progress goes to stderr, one line per step,
+starting with "progress ".
+
+HOW. A recording is reduced to where sound starts in the speech range, 8 bands
+from 250 to 3500 Hz, 100 times a second (spectral flux). Game sound differs
+between the recordings, the voices do not, and talk and pauses make a pattern
+that is unique over a minute. Every 60 s window of one recording is slid along
+the whole of the other, and the best match is kept when it stands far above
+everything else (robust z score). Most windows agree on one offset, a window
+of game sound alone matches nothing and is dropped.
+
+A voice reaches the other recordings late, through the voice chat or the game,
+so the windows split into two groups about 0.4 s apart (the measured case):
+the ones where the first recording's owner talks, and the ones where the
+other one does. The session is in sync halfway between them, and that is the
+answer whenever both groups are there.
+
+Every pair of recordings is measured, and the offsets are solved together by
+least squares. Two players who were never near each other in a game with
+proximity voice still line up through a third who was near both.
+
+Measured on four 80 minute recordings of one session: every pair agreed, the
+offsets agreed around every loop within 0.2 s, and an on screen game timer
+ticked within 6 to 14 frames across all four. Each pair takes about 5 s.
+
+The sound of a recording is reduced once and kept as features (about 8 MB an
+hour) in $XDG_CACHE_HOME/mpv-pov-sync, so adding one more recording to a set
+fetches only the new one. Files unused for two weeks are removed.
+
+--raw passes mpv's ytdl-raw-options to yt-dlp the way ytdl_hook does, so the
+cookies and the history marking are the same as for the video mpv plays.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+import numpy as np
+
+SR = 8000
+HOP = 80                      # 10 ms
+NFFT = 256                    # 32 ms
+FPS = SR // HOP
+EDGES = np.geomspace(250, 3500, 9)
+WIN_S, HOP_S = 60, 30
+
+# A window's best match counts when it stands this far above the rest. Real
+# matches measured z 13 to 40, game sound alone below 8.
+Z_MIN = 8.0
+# Two offsets this close belong to one match, the voice chat delay included.
+SPAN_S = 1.0
+# Both voice groups must hold this share of the windows to be taken as two.
+GROUP_MIN = 0.2
+GROUP_GAP_S = 0.12
+# A pair needs this many agreeing windows to count.
+MIN_WINDOWS = 3
+# A pair that disagrees with the joint solution by more is dropped.
+MAX_RESIDUAL_S = 0.5
+
+FORMAT = ("bv*[height<=1080][format_note*=Premium]+ba/"
+          "bv*[height<=1080]+ba/b[height<=1080]/b")
+AUDIO_FORMAT = "wa[acodec=opus]/wa/ba"
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                     "mpv-pov-sync")
+KEEP_DAYS = 14
+# Black picture and silence, shown before a recording that started later than
+# the first one. The player repeats it for longer gaps.
+BLANK_SECS = 600
+
+
+def progress(text):
+    print("progress " + text, file=sys.stderr, flush=True)
+
+
+def video_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|/live/|/shorts/|/embed/)([\w-]{11})", url)
+    if m:
+        return m.group(1)
+    return re.sub(r"[^\w-]", "_", url)[-80:]
+
+
+def ytdl_args(raw):
+    out = []
+    for item in raw:
+        key, _, value = item.partition("=")
+        out.append("--" + key + ("=" + value if value else ""))
+    return out
+
+
+def fetch_info(url, fmt, raw):
+    r = subprocess.run(["yt-dlp", "-J", "--no-warnings", "--no-playlist", "-f", fmt,
+                        *ytdl_args(raw), "--", url],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip().splitlines() or ["yt-dlp failed"])[-1])
+    info = json.loads(r.stdout)
+    # the sound of a stream that is still running would download for ever
+    if info.get("is_live"):
+        raise RuntimeError("still live, it can be lined up once the stream has ended")
+    return info
+
+
+def stream_urls(info):
+    formats = info.get("requested_formats") or [info]
+    video = next((f["url"] for f in formats if f.get("vcodec") not in (None, "none")), None)
+    audio = next((f["url"] for f in formats if f.get("acodec") not in (None, "none")), None)
+    return video, audio
+
+
+def decode(path):
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", str(SR),
+                          "-f", "f32le", "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32)
+
+
+def features(x):
+    """Spectral flux per speech band at FPS frames a second, normalised per band."""
+    win = np.hanning(NFFT).astype(np.float32)
+    freqs = np.fft.rfftfreq(NFFT, 1 / SR)
+    bands = [np.where((freqs >= lo) & (freqs < hi))[0] for lo, hi in zip(EDGES[:-1], EDGES[1:])]
+    n = (len(x) - NFFT) // HOP + 1
+    out = np.empty((len(bands), max(n, 0)), dtype=np.float32)
+    step = FPS * 60
+    for s in range(0, n, step):
+        e = min(n, s + step)
+        frames = np.lib.stride_tricks.as_strided(x[s * HOP:], shape=(e - s, NFFT),
+                                                 strides=(HOP * 4, 4))
+        power = np.abs(np.fft.rfft(frames * win, axis=1)) ** 2
+        for b, ix in enumerate(bands):
+            out[b, s:e] = np.log(power[:, ix].sum(axis=1) + 1e-9)
+    flux = np.maximum(0, np.diff(out, axis=1, prepend=out[:, :1]))
+    flux -= flux.mean(axis=1, keepdims=True)
+    flux /= flux.std(axis=1, keepdims=True) + 1e-9
+    # one loud bang must not outweigh a minute of talk
+    return np.clip(flux, -3, 8).astype(np.float16)
+
+
+def load_features(vid, info, tmp):
+    path = os.path.join(CACHE, vid + ".npy")
+    if os.path.exists(path):
+        os.utime(path)
+        return np.load(path)
+    info_file = os.path.join(tmp, vid + ".info.json")
+    with open(info_file, "w") as f:
+        json.dump(info, f)
+    # the stored answer is reused, so the video is not looked up a second time
+    r = subprocess.run(["yt-dlp", "-q", "--no-warnings", "--load-info-json", info_file,
+                        "-f", AUDIO_FORMAT, "-o", os.path.join(tmp, vid + ".audio.%(ext)s")],
+                       capture_output=True, text=True)
+    files = [n for n in os.listdir(tmp) if n.startswith(vid + ".audio.")]
+    if r.returncode != 0 or not files:
+        raise RuntimeError((r.stderr.strip().splitlines() or ["audio download failed"])[-1])
+    audio = os.path.join(tmp, files[0])
+    feat = features(decode(audio))
+    os.remove(audio)
+    np.save(path + ".part.npy", feat)
+    os.replace(path + ".part.npy", path)
+    return feat
+
+
+def scan(A, B):
+    """Slides 60 s windows of B along all of A. Returns (offset, z) per window,
+    offset such that time in A = time in B + offset."""
+    A = A.astype(np.float64)
+    B = B.astype(np.float64)
+    L = WIN_S * FPS
+    nA = A.shape[1]
+    if nA < L or B.shape[1] < L:
+        return []
+    N = 1 << int(np.ceil(np.log2(nA + L)))
+    FA = np.fft.rfft(A, n=N, axis=1)
+    energy = np.concatenate([[0], np.cumsum((A ** 2).sum(axis=0))])
+    valid = nA - L + 1
+    sliding = np.sqrt(np.maximum(energy[L:L + valid] - energy[:valid], 1e-9))
+    rows = []
+    for s in range(0, B.shape[1] - L + 1, HOP_S * FPS):
+        w = B[:, s:s + L]
+        norm = np.sqrt((w ** 2).sum()) + 1e-9
+        c = np.fft.irfft((FA * np.conj(np.fft.rfft(w, n=N, axis=1))).sum(axis=0), n=N)[:valid]
+        ncc = c / (sliding * norm)
+        p = int(np.argmax(ncc))
+        med = np.median(ncc)
+        mad = np.median(np.abs(ncc - med)) * 1.4826 + 1e-12
+        rows.append(((p - s) / FPS, float((ncc[p] - med) / mad)))
+    return rows
+
+
+def weighted_median(values, weights):
+    order = np.argsort(values)
+    v, w = values[order], weights[order]
+    c = np.cumsum(w)
+    return float(v[np.searchsorted(c, c[-1] / 2)])
+
+
+def pair_offset(rows):
+    """One offset from the windows of a pair, or None. Returns (offset, weight)."""
+    if not rows:
+        return None
+    r = np.array(rows)
+    good = r[r[:, 1] >= Z_MIN]
+    if len(good) < MIN_WINDOWS:
+        return None
+    order = np.argsort(good[:, 0])
+    d, w = good[order, 0], good[order, 1]
+    # the densest SPAN_S of offsets, weighted by how clear each match was
+    best, lo, hi, j = -1.0, 0, 0, 0
+    for i in range(len(d)):
+        while j < len(d) and d[j] <= d[i] + SPAN_S:
+            j += 1
+        s = w[i:j].sum()
+        if s > best:
+            best, lo, hi = s, i, j
+    d, w = d[lo:hi], w[lo:hi]
+    if len(d) < MIN_WINDOWS:
+        return None
+    # two voice groups: split at the widest gap that leaves both big enough
+    total = w.sum()
+    split, gap = None, GROUP_GAP_S
+    for k in range(1, len(d)):
+        g = d[k] - d[k - 1]
+        left = w[:k].sum() / total
+        if g >= gap and GROUP_MIN <= left <= 1 - GROUP_MIN:
+            split, gap = k, g
+    if split is None:
+        offset = weighted_median(d, w)
+    else:
+        offset = (weighted_median(d[:split], w[:split]) + weighted_median(d[split:], w[split:])) / 2
+    return offset, float(len(d))
+
+
+def pair_rows(a, b, fa, fb):
+    path = os.path.join(CACHE, f"{a}+{b}.json")
+    if os.path.exists(path):
+        os.utime(path)
+        with open(path) as f:
+            return json.load(f)
+    rows = scan(fa, fb)
+    with open(path + ".part", "w") as f:
+        json.dump(rows, f)
+    os.replace(path + ".part", path)
+    return rows
+
+
+def solve(n, pairs):
+    """pairs: (i, j, x_j - x_i, weight). Returns offsets (x_0 = 0) and the set of
+    videos tied to video 0, by weighted least squares, dropping pairs that do
+    not fit the others."""
+    pairs = list(pairs)
+    while True:
+        linked, grew = {0}, True
+        while grew:
+            grew = False
+            for i, j, _, _ in pairs:
+                if (i in linked) != (j in linked):
+                    linked |= {i, j}
+                    grew = True
+        idx = {k: c for c, k in enumerate(sorted(linked - {0}))}
+        x = np.zeros(n)
+        if idx:
+            rows, rhs = [], []
+            for i, j, m, w in pairs:
+                if i not in linked or j not in linked:
+                    continue
+                row = np.zeros(len(idx))
+                if j in idx:
+                    row[idx[j]] += 1
+                if i in idx:
+                    row[idx[i]] -= 1
+                s = np.sqrt(w)
+                rows.append(row * s)
+                rhs.append(m * s)
+            sol = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0]
+            for k, c in idx.items():
+                x[k] = sol[c]
+        worst, wi = 0.0, None
+        for c, (i, j, m, w) in enumerate(pairs):
+            if i in linked and j in linked:
+                res = abs(x[j] - x[i] - m)
+                if res > worst:
+                    worst, wi = res, c
+        if worst <= MAX_RESIDUAL_S:
+            return x, linked
+        pairs.pop(wi)
+
+
+def ensure_blank():
+    path = os.path.join(CACHE, "blank.mkv")
+    if os.path.exists(path):
+        os.utime(path)
+        return path
+    part = path + ".part.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=64x36:r=1",
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+                    "-t", str(BLANK_SECS), "-c:v", "libx264", "-preset", "veryslow",
+                    "-tune", "stillimage", "-g", "600", "-pix_fmt", "yuv420p",
+                    "-c:a", "libopus", "-b:a", "6k", part], check=True)
+    os.replace(part, path)
+    return path
+
+
+def prune():
+    limit = time.time() - KEEP_DAYS * 86400
+    for name in os.listdir(CACHE):
+        path = os.path.join(CACHE, name)
+        try:
+            if os.path.isfile(path) and os.path.getatime(path) < limit and \
+                    os.path.getmtime(path) < limit:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="line up recordings of one session by their sound")
+    ap.add_argument("--raw", action="append", default=[], help="a ytdl-raw-options entry, KEY=VALUE")
+    ap.add_argument("--format", default=FORMAT, help="yt-dlp format of the streams to play")
+    ap.add_argument("urls", nargs="+")
+    args = ap.parse_args()
+    os.makedirs(CACHE, exist_ok=True)
+    prune()
+
+    urls = args.urls
+    ids = [video_id(u) for u in urls]
+    n = len(urls)
+    infos, feats, errors = [None] * n, [None] * n, [None] * n
+    done = [0]
+
+    def prepare(k):
+        try:
+            infos[k] = fetch_info(urls[k], args.format, args.raw)
+            feats[k] = load_features(ids[k], infos[k], tmp)
+        except Exception as e:  # noqa: BLE001, one bad video must not stop the rest
+            errors[k] = str(e)
+        done[0] += 1
+        progress(f"sound {done[0]}/{n}")
+
+    with tempfile.TemporaryDirectory(dir=CACHE, prefix="tmp-") as tmp:
+        progress(f"sound 0/{n}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+            list(pool.map(prepare, range(n)))
+
+    ok = [k for k in range(n) if feats[k] is not None]
+    pairs = []
+    todo = [(i, j) for i in ok for j in ok if i < j]
+    for c, (i, j) in enumerate(todo):
+        progress(f"matching {c + 1}/{len(todo)}")
+        est = pair_offset(pair_rows(ids[i], ids[j], feats[i], feats[j]))
+        if est:
+            # time in i = time in j + d, so x_j - x_i = -d
+            pairs.append((i, j, -est[0], est[1]))
+    x, linked = solve(n, pairs) if 0 in ok else (np.zeros(n), set())
+
+    videos = []
+    for k in range(n):
+        info = infos[k] or {}
+        video, audio = stream_urls(info) if infos[k] else (None, None)
+        videos.append({
+            "url": urls[k], "id": ids[k],
+            "title": info.get("title") or urls[k],
+            "channel": info.get("channel") or info.get("uploader") or "",
+            "duration": info.get("duration"),
+            "offset": round(float(x[k]), 3) if k in linked else 0.0,
+            "matched": k in linked,
+            "video": video, "audio": audio,
+            "error": errors[k],
+        })
+    later = any(v["matched"] and v["offset"] < 0 for v in videos)
+    json.dump({"videos": videos, "blank": ensure_blank() if later else None,
+               "blank_secs": BLANK_SECS}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0 if 0 in linked and len(linked) > 1 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -35,6 +35,9 @@ tuning.
 * **Per video volume** remembered for every video, and a fresh player starts at the last volume
 * **Queue mode** (F9) makes browser clicks stack up into a looping playlist instead of
   replacing the video
+* **Several points of view** of one gaming session in one window, lined up by the voice chat
+  they share and played under one seek bar. In POV mode (Shift+F9) a click adds a view instead
+  of replacing the video. Drag a view onto another to swap them, 1 to 9 make one big
 * **Key cheat sheet** on h, read from `input.conf`, showing which shader is really active
 * **YouTube Premium** enhanced bitrate, with cookies read live from the browser profile so the
   login never expires, and watched videos land in the YouTube history
@@ -46,7 +49,7 @@ tuning.
 
 ## Install
 
-Needs `mpv`, `yt-dlp`, `ffmpeg`, `curl`, `socat`, `jq`, `python3`, `streamlink` with
+Needs `mpv`, `yt-dlp`, `ffmpeg`, `curl`, `socat`, `jq`, `python3` with `numpy`, `streamlink` with
 `streamlink-ttvlol`, `ff2mpv-rust` and the ff2mpv extension for
 [Firefox](https://addons.mozilla.org/firefox/addon/ff2mpv/) or
 [Chrome](https://chromewebstore.google.com/detail/ff2mpv/ephjcajbkgplkjmelpglennepbpmdpjg).

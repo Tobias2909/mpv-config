@@ -2255,6 +2255,14 @@ mp.set_key_bindings({
     { "mbtn_right", on_right },
 }, UI.section_head, "force")
 
+-- Another script took clicks over the video (pov_sync.lua's views) and its
+-- section, enabled last, now wins over the box. Enabling the box's sections
+-- again puts them back on top, the head first as area_sync does.
+mp.register_script_message("input-section-raised", function()
+    if head_on then mp.enable_key_bindings(UI.section_head, "allow-hide-cursor") end
+    if area_on then mp.enable_key_bindings(UI.section, "allow-hide-cursor") end
+end)
+
 mp.set_key_bindings({
     { "mbtn_left",     on_up, on_down },
     { "mbtn_left_dbl", function() end },

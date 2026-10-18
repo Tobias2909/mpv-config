@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Toggle mpv's POV mode from outside mpv (bind it to a KDE global shortcut, so
+# it works while Weave or the browser has the focus and mpv is fullscreen on
+# the TV). While it is on, a clicked video joins the one playing as one more
+# point of view instead of replacing it.
+#
+# pov_sync.lua owns the state and shows it on the OSD. It lives in the running
+# mpv only, so with no player there is nothing to switch: the first video
+# starts the normal way and becomes the one the others line up with.
+
+set -u
+
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/mpv-ff2mpv.sock"
+
+reply="$(printf '%s\n' '{"command":["script-message","pov-mode-toggle"]}' \
+    | socat -t 0.5 - "UNIX-CONNECT:$SOCK" 2>/dev/null)"
+if ! jq -e '.error == "success"' <<<"$reply" >/dev/null 2>&1; then
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send -a mpv -t 4000 "mpv" "POV mode needs a video playing in mpv first"
+fi
+exit 0
