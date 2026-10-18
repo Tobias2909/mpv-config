@@ -43,7 +43,15 @@
 --
 -- Keys while views play: 1 to 9 make that view big and play its sound, the
 -- same key again or 0 shows all views the same size, Alt+1 to Alt+9 only
--- switch the sound.
+-- switch the sound, Ctrl+1 to Ctrl+9 put that view on the other screen, the
+-- same key again or Ctrl+0 brings it back.
+--
+-- TWO SCREENS. A view on the other screen is played by a second mpv in a
+-- window of its own, kept in step with this one by follower.lua (how is
+-- written there), and the TV keeps the other views. Its sound is the second
+-- player's, so while it is heard this one plays without sound (aid=no) and
+-- passes on its volume and mute. Keys pressed in its window come back here
+-- as if pressed here, so both windows answer the same keys.
 --
 -- DRAGGING. A view dragged onto another trades places with it, in whichever
 -- layout is showing, and each layout keeps its own order. The clicks come
@@ -69,6 +77,7 @@ local options = require 'mp.options'
 package.path = mp.command_native({ "expand-path", "~~/script-modules/?.lua" })
                .. ";" .. package.path
 local spawn   = require 'spawn'
+local follower = require 'follower'
 local ffi     = require 'ffi'
 
 local o = {
@@ -83,6 +92,10 @@ local o = {
     canvas_h = 0,
     -- share of the window height at the bottom that stays the seek bar's
     bar = 0.15,
+    -- the screen a view goes to on Ctrl+1 to Ctrl+9
+    screen = "DP-1",
+    -- more mpv options for the player on that screen, split at spaces
+    screen_args = "",
 }
 options.read_options(o, "pov_sync")
 
@@ -119,6 +132,9 @@ local canvas = nil      -- { w, h } the graph was built for
 local tiles = nil       -- current layout, per view index: { x, y, w, h }
 local slots = nil       -- the same rectangles, per place
 local drag = nil        -- a held view: { from, to } places
+local placed = {}       -- place -> view index, the views on the TV only
+local away = nil        -- index of the view on the other screen
+local second = nil      -- the player showing it (follower.lua)
 local adding = false    -- POV mode: clicked videos join the file that plays
 local SECTION = "pov-views"
 local overlay = mp.create_osd_overlay("ass-events")
@@ -129,7 +145,8 @@ local ADD_WAIT = 1.5
 
 -- read by the wrapper and the h sheet
 local function publish()
-    mp.set_property_native("user-data/pov_sync", { adding = adding, views = #views })
+    mp.set_property_native("user-data/pov_sync", { adding = adding, views = #views,
+                                                   away = away, screen = o.screen })
 end
 
 local function helper_cmd()
@@ -232,16 +249,29 @@ local function focus_tiles(n, W, H)
     return out
 end
 
+-- the views the TV shows, in the order they go into the graph
+local function on_tv()
+    local list = {}
+    for k in ipairs(views) do
+        if k ~= away then list[#list + 1] = k end
+    end
+    return list
+end
+
 -- sets the places of the current layout and which view sits in each
 local function compute_tiles()
-    local n = #views
+    placed = {}
+    for _, k in ipairs(order[mode]) do
+        if k ~= away then placed[#placed + 1] = k end
+    end
+    local n = #placed
     if mode == "focus" and n > 1 then
         slots = focus_tiles(n, canvas.w, canvas.h)
     else
         slots = grid_tiles(n, canvas.w, canvas.h)
     end
     tiles = {}
-    for s, k in ipairs(order[mode]) do tiles[k] = slots[s] end
+    for s, k in ipairs(placed) do tiles[k] = slots[s] end
 end
 
 ---------------------------------------------------------------- labels
@@ -300,6 +330,15 @@ local function draw_labels(show)
                 :format(x + math.floor(fs / 2), y + math.floor(fs / 3), fs, text)
         end
     end
+    if away and views[away] then
+        -- bottom left above the seek bar's strip, clear of the view labels
+        -- (top centre ran into the top right view's label with three views)
+        local text = ("%d  %s  on %s%s"):format(away, views[away].name, o.screen,
+                                               away == heard and "  ♪" or "")
+        local bottom = math.min(p.y + p.h, p.oh * (1 - o.bar))
+        ev[#ev + 1] = ("{\\an1\\pos(%d,%d)\\fs%d\\bord3\\shad0\\1c&HFFFFFF&\\3c&H000000&}%s")
+            :format(p.x + math.floor(fs / 2), math.floor(bottom - fs / 3), fs, text)
+    end
     overlay.data = table.concat(ev, "\n")
     overlay:update()
 end
@@ -318,9 +357,10 @@ local function write_layout_files()
     for k, t in pairs(tiles) do
         first[#first + 1] = ("overlay@o%d x %d, overlay@o%d y %d"):format(k, t.x, k, t.y)
     end
+    local head = on_tv()[1]
     for k, t in pairs(tiles) do
         local cmds = ("scale@s%d w %d, scale@s%d h %d"):format(k, t.w, k, t.h)
-        if k == 1 then cmds = cmds .. ", " .. table.concat(first, ", ") end
+        if k == head then cmds = cmds .. ", " .. table.concat(first, ", ") end
         write_file(("%s/layout%d.cmd"):format(RUN, k), "0 " .. cmds .. ";\n")
     end
 end
@@ -355,28 +395,29 @@ end
 
 local function build_graph()
     local p = {}
-    local n = #views
-    for k, v in ipairs(views) do
-        local t = tiles[k]
+    local list = on_tv()
+    local n = #list
+    for i, k in ipairs(list) do
+        local v, t = views[k], tiles[k]
         -- no format filter after the scale: overlay takes yuva420p only, and a
         -- conversion libavfilter adds by itself keeps the size it was built
         -- with, which undid every live resize (measured)
         local scale = ("scale@s%d=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1")
             :format(k, t.w, t.h)
         local cmd = ("sendcmd=f='%s/layout%d.cmd'"):format(RUN, k)
-        if k == 1 then
-            p[#p + 1] = ("[vid%d]%s,split[canvas][src1]"):format(v.vid, cmd)
+        if i == 1 then
+            p[#p + 1] = ("[vid%d]%s,split[canvas][src%d]"):format(v.vid, cmd, k)
             p[#p + 1] = ("[canvas]scale=2:2,pad=%d:%d:0:0:black,setsar=1,format=yuv420p[bg0]")
                 :format(canvas.w, canvas.h)
-            p[#p + 1] = ("[src1]%s[v1]"):format(scale)
+            p[#p + 1] = ("[src%d]%s[v%d]"):format(k, scale, k)
         else
             p[#p + 1] = ("[vid%d]%s,%s[v%d]"):format(v.vid, cmd, scale, k)
         end
     end
-    for k = 1, n do
+    for i, k in ipairs(list) do
         local t = tiles[k]
-        local tail = k == n and (",zmq=b='ipc\\://%s'[vo]"):format(ENDPOINT) or ("[bg%d]"):format(k)
-        p[#p + 1] = ("[bg%d][v%d]overlay@o%d=x=%d:y=%d:eof_action=pass%s"):format(k - 1, k, k, t.x, t.y, tail)
+        local tail = i == n and (",zmq=b='ipc\\://%s'[vo]"):format(ENDPOINT) or ("[bg%d]"):format(i)
+        p[#p + 1] = ("[bg%d][v%d]overlay@o%d=x=%d:y=%d:eof_action=pass%s"):format(i - 1, k, k, t.x, t.y, tail)
     end
     return table.concat(p, ";")
 end
@@ -422,6 +463,7 @@ local function rebuild()
     compute_tiles()
     write_layout_files()
     mp.set_property("lavfi-complex", build_graph())
+    publish()
     zmq_connect()
     area_sync()
     flash_labels()
@@ -442,7 +484,17 @@ local function hear(k)
     local v = views[k]
     if not v or not v.aid then return end
     heard = k
-    mp.set_property_number("aid", v.aid)
+    if k == away and second then
+        mp.set_property("aid", "no")
+        second:set("volume", mp.get_property_number("volume", 100))
+        second:set("mute", mp.get_property_bool("mute"))
+    else
+        if second then second:set("mute", true) end
+        mp.set_property_number("aid", v.aid)
+    end
+    if second then
+        second:show(("%d  %s%s"):format(away, views[away].name, away == heard and "  ♪" or ""), o.label_secs)
+    end
     flash_labels()
 end
 
@@ -450,17 +502,114 @@ end
 -- view's own key goes back to equal sizes
 local function choose(k)
     if not views[k] then return end
+    -- the one on the other screen cannot be big here, it is only heard
+    if k == away then return hear(k) end
     local f = order.focus
-    if mode == "focus" and f[1] == k then
+    local big = 1
+    while f[big] == away do big = big + 1 end
+    if mode == "focus" and f[big] == k then
         mode = "grid"
     else
         mode = "focus"
-        for s = 2, #f do
-            if f[s] == k then f[1], f[s] = f[s], f[1] end
+        for s = 1, #f do
+            if f[s] == k then f[big], f[s] = f[s], f[big] end
         end
     end
     hear(k)
     relayout()
+end
+
+---------------------------------------------------------------- the other screen
+
+-- the keys of the second player's window: every key this player has a
+-- binding for comes back here, except the window's own
+local function write_second_input()
+    local lines = { "CLOSE_WIN quit", "f cycle fullscreen", "MBTN_LEFT_DBL cycle fullscreen" }
+    local seen = { CLOSE_WIN = true, f = true, MBTN_LEFT_DBL = true }
+    for _, b in ipairs(mp.get_property_native("input-bindings") or {}) do
+        local key = b.key
+        local up = key and key:upper() or ""
+        if key and not seen[key] and key:match("^[%w_+%-<>%[%]{}.,/=!?:']+$")
+           and not up:match("^MBTN_LEFT") and not up:match("MOUSE") and not up:match("AXIS") then
+            seen[key] = true
+            lines[#lines + 1] = ('%s script-message pov-key "%s"'):format(key, key)
+        end
+    end
+    write_file(RUN .. "/second-input.conf", table.concat(lines, "\n") .. "\n")
+end
+
+local bring_back
+
+local function start_second(k)
+    local v = views[k]
+    write_second_input()
+    local args = {
+        "--vo=" .. (mp.get_property("vo") or "gpu-next"),
+        "--gpu-api=" .. (mp.get_property("gpu-api") or "auto"),
+        "--hwdec=" .. (saved and saved.hwdec or mp.get_property("hwdec") or "auto"),
+        "--fullscreen", "--force-window=yes",
+        "--fs-screen-name=" .. o.screen, "--screen-name=" .. o.screen,
+        "--force-media-title=" .. v.name,
+        "--osc=no", "--ytdl=no",
+        "--input-default-bindings=no", "--input-conf=" .. RUN .. "/second-input.conf",
+        "--demuxer-max-bytes=" .. o.cache_mib .. "MiB",
+        "--demuxer-max-back-bytes=" .. o.cache_mib .. "MiB",
+        ("--volume=%g"):format(mp.get_property_number("volume", 100)),
+        "--mute=" .. (k == heard and (mp.get_property("mute") or "no") or "yes"),
+    }
+    for a in o.screen_args:gmatch("%S+") do args[#args + 1] = a end
+    local log = RUN .. "/second.log"
+    second = follower.start({
+        file = v.vedl, audio = v.aedl, args = args, log = log,
+        on_message = function(m)
+            if m[1] == "pov-key" and m[2] then mp.commandv("keypress", m[2]) end
+        end,
+        -- closed in its window, or it could not play
+        on_exit = function(status)
+            second = nil
+            if away ~= k then return end
+            if status ~= 0 then
+                mp.osd_message("POV: the player on " .. o.screen .. " stopped", 5)
+                msg.error(read_file(log) or "")
+            end
+            bring_back()
+        end,
+    })
+end
+
+bring_back = function()
+    if not away then return end
+    local k = away
+    away = nil
+    if second then second:stop() end
+    second = nil
+    rebuild()
+    if heard == k then hear(k) end
+end
+
+-- the view goes to the other screen, the one there comes back
+local function send_away(k)
+    local v = views[k]
+    if not v or #views < 2 then return end
+    if k == away then return bring_back() end
+    if not v.vedl then
+        mp.osd_message("POV: no stream of that view to play elsewhere", 4)
+        return
+    end
+    if second then second:stop() end
+    second = nil
+    away = k
+    spawn.wait({ "mkdir", "-p", RUN })
+    rebuild()
+    start_second(k)
+    if not second then
+        away = nil
+        rebuild()
+        mp.osd_message("POV: the second player did not start", 5)
+        return
+    end
+    -- the sound goes with its view, to whichever player now shows it
+    hear(heard)
 end
 
 local function on_down()
@@ -478,8 +627,11 @@ local function on_up()
     drag = nil
     area_sync()
     if d.to and d.to ~= d.from then
+        local a, b = placed[d.from], placed[d.to]
         local ord = order[mode]
-        ord[d.from], ord[d.to] = ord[d.to], ord[d.from]
+        for i, k in ipairs(ord) do
+            if k == a then ord[i] = b elseif k == b then ord[i] = a end
+        end
         relayout()
     else
         flash_labels()
@@ -505,6 +657,10 @@ local function bind_keys()
         mp.add_forced_key_binding("Alt+" .. k, "pov-hear-" .. k, function() hear(k) end)
     end
     mp.add_forced_key_binding("0", "pov-grid", function() mode = "grid"; relayout() end)
+    for k = 1, MAX_VIEWS do
+        mp.add_forced_key_binding("Ctrl+" .. k, "pov-screen-" .. k, function() send_away(k) end)
+    end
+    mp.add_forced_key_binding("Ctrl+0", "pov-tv", bring_back)
     area_sync()
     mp.enable_key_bindings(SECTION, "allow-hide-cursor")
     mp.commandv("script-message", "input-section-raised")
@@ -516,6 +672,8 @@ local function unbind_keys()
         mp.remove_key_binding("pov-hear-" .. k)
     end
     mp.remove_key_binding("pov-grid")
+    for k = 1, MAX_VIEWS do mp.remove_key_binding("pov-screen-" .. k) end
+    mp.remove_key_binding("pov-tv")
     mp.disable_key_bindings(SECTION)
     drag = nil
 end
@@ -545,6 +703,8 @@ local function stop_job()
 end
 
 local function leave()
+    if second then second:stop() end
+    second, away, placed = nil, nil, {}
     stop_job()
     if add_timer then add_timer:kill() end
     add_timer = nil
@@ -640,7 +800,12 @@ local function add_tracks(result)
         mp.osd_message("POV: the playing video cannot be lined up, " .. first.error, 8)
         return
     end
-    if first then views[1].name = short_name(first) end
+    if first then
+        views[1].name = short_name(first)
+        -- what the other screen plays when this one goes there
+        views[1].vedl = first.video and shifted(first.video, 0, result.blank, result.blank_secs)
+        views[1].aedl = first.audio and shifted(first.audio, 0, result.blank, result.blank_secs)
+    end
     local have = {}
     for _, v in ipairs(views) do have[v.url] = true end
     for i, r in ipairs(result.videos) do
@@ -795,6 +960,14 @@ end)
 
 mp.add_hook("on_unload", 50, function()
     if leader then leave() end
+end)
+
+-- while the other screen's view is heard, its sound follows this one's
+mp.observe_property("volume", "number", function(_, v)
+    if second and heard == away and v then second:set("volume", v) end
+end)
+mp.observe_property("mute", "bool", function(_, m)
+    if second and heard == away then second:set("mute", m) end
 end)
 
 -- a resized window moves the picture, and the clickable area with it

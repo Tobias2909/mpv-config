@@ -34,6 +34,8 @@ local DESC = {
     ["1-9"] = "That view big + its sound",
     ["Alt+1-9"] = "Only that view's sound",
     ["0"] = "All views the same size",
+    ["Ctrl+1-9"] = "That view to the other screen",
+    ["Ctrl+0"] = "All views back on this one",
     ["drag view"] = "Onto another one: swap the two",
     F10 = "Chat: off -> beside -> over (streams only)",
     F11 = "Chat emote animation on/off",
@@ -227,6 +229,7 @@ local STATE = {
         local views = tonumber(p.views) or 0
         local text = p.adding and "ON" or "off"
         if views > 1 then text = text .. ", " .. views .. " views" end
+        if p.away then text = text .. ", " .. p.away .. " on " .. tostring(p.screen) end
         return text
     end,
 }
@@ -250,7 +253,7 @@ local GROUPS = {
     { "Upscaler / picture", { "F1", "F2", "F6", "F7", "F8", "F5" }, pixel_rate_note },
     { "Playback",           { "F4", "UP", "DOWN", "+", "-", "BS" } },
     { "Translation",        { "F12", "Shift+F12" }, translation_notes },
-    { "Points of view",     { "Shift+F9", "1-9", "Alt+1-9", "0", "drag view" } },
+    { "Points of view",     { "Shift+F9", "1-9", "Alt+1-9", "0", "Ctrl+1-9", "Ctrl+0", "drag view" } },
     { "Queue / loop",       { "F9" } },
     { "Info",               { "F3" } },
 }

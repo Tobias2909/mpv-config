@@ -20,7 +20,8 @@
 -- handle, or nil when it could not start. opts.stdout and opts.stderr name
 -- files for the output, anything else goes to /dev/null, and stdin is
 -- /dev/null. opts.done(status) is called with the exit code once the child
--- ends, or with -1 when a signal ended it.
+-- ends, or with -1 when a signal ended it. opts.fd hands the child one more
+-- open descriptor, which it gets as its fd 3 (ffi only).
 -- spawn.kill(handle) kills a child. Its done is never called.
 -- spawn.wait(args, opts) starts a child and blocks until it ends, then
 -- returns the status, or -1 when it could not start.
@@ -93,6 +94,7 @@ int posix_spawn_file_actions_destroy(spawn_actions_t *actions);
 int posix_spawn_file_actions_addopen(spawn_actions_t *actions, int fd, const char *path,
                                      int flags, unsigned int mode);
 int posix_spawn_file_actions_addclosefrom_np(spawn_actions_t *actions, int from);
+int posix_spawn_file_actions_adddup2(spawn_actions_t *actions, int fd, int newfd);
 int sigemptyset(spawn_sigset_t *set);
 int sigfillset(spawn_sigset_t *set);
 int waitpid(pid_t pid, int *status, int options);
@@ -161,7 +163,9 @@ local function launch(args, opts)
     C.posix_spawn_file_actions_addopen(actions, 0, "/dev/null", O_RDONLY, 0)
     C.posix_spawn_file_actions_addopen(actions, 1, opts.stdout or "/dev/null", out, 384)
     C.posix_spawn_file_actions_addopen(actions, 2, opts.stderr or "/dev/null", out, 384)
-    if has_closefrom then C.posix_spawn_file_actions_addclosefrom_np(actions, 3) end
+    -- a copy made by dup2 is never close on exec, whatever the original is
+    if opts.fd then C.posix_spawn_file_actions_adddup2(actions, opts.fd, 3) end
+    if has_closefrom then C.posix_spawn_file_actions_addclosefrom_np(actions, opts.fd and 4 or 3) end
     -- the same clean start mpv's own subprocess gives a child: default signal
     -- handlers and nothing blocked
     C.posix_spawnattr_init(attr)
