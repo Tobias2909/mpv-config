@@ -11,12 +11,14 @@ says where it is when the first one is at zero, plus the stream URLs the
 player opens, as one JSON object on stdout:
 
     {"videos": [{"url", "id", "title", "channel", "duration",
-                 "offset", "video", "audio", "matched", "error"}, ...]}
+                 "offset", "video", "audio", "matched", "error",
+                 "pieces"}, ...]}
 
 `offset` is in seconds, position in this video = position in the first + offset.
 `matched` is false for a video whose sound matched none of the others, its
-offset is then 0 and means nothing. Progress goes to stderr, one line per step,
-starting with "progress ".
+offset is then 0 and means nothing. `pieces` is there only for a video that was
+cut or had something put in (see CUTS). Progress goes to stderr, one line per
+step, starting with "progress ".
 
 HOW. A recording is reduced to where sound starts in the speech range, 8 bands
 from 250 to 3500 Hz, 100 times a second (spectral flux). Game sound differs
@@ -39,6 +41,29 @@ proximity voice still line up through a third who was near both.
 Measured on four 80 minute recordings of one session: every pair agreed, the
 offsets agreed around every loop within 0.2 s, and an on screen game timer
 ticked within 6 to 14 frames across all four. Each pair takes about 5 s.
+
+CUTS. A recording can be cut after the session, or have something put in,
+like a sponsor read. From there on its offset is another one. Every pair's
+windows are split into stretches of one offset, and a change counts when the
+new offset holds 2.5 min and the windows stop matching at the old one. Short
+detours are dropped: a clip watched again or a song played twice matches far
+away for a minute or two, and still matches at the right offset too. Which
+recording changed is then solved bin by bin like the offsets themselves, so a
+cut in the first recording moves all the others. The exact place is searched
+second by second against recordings that run straight through it: for a
+change every other recording makes too, the first one alone.
+
+A video with changes gets "pieces", the parts of it on the first one's time:
+[{"from", "to", "at"}], playing from "at" in the video between "from" and "to",
+"to" null for a part that runs to its end. Between parts it shows black.
+
+Measured by cutting and filling the sound of the four recordings above in 32
+places, 3 s to 5 min, in one of the others or in the first: every change was
+found and placed, the views off for at most 4 s around it. No change was found
+in the recordings as they are or around a stretch of 3 to 8 min that all of
+them played again. It needs the voices on both sides: a change less than 2.5
+min from another one, from either end, or in a long stretch nobody talks is
+not found, and the video keeps one offset as before.
 
 The sound of a recording is reduced once and kept as features (about 8 MB an
 hour) in $XDG_CACHE_HOME/mpv-pov-sync, so adding one more recording to a set
@@ -79,6 +104,28 @@ GROUP_GAP_S = 0.12
 MIN_WINDOWS = 3
 # A pair that disagrees with the joint solution by more is dropped.
 MAX_RESIDUAL_S = 0.5
+
+# Cuts. A recording can be cut, or have something put in, after the session.
+# A pair's offset then changes for good, and it counts when the new one holds
+# this many windows in a row (2.5 min of sound) ...
+MIN_RUN = 4
+# ... is this much away from the one before ...
+MIN_JUMP_S = 2.0
+# ... and the windows stop matching at the one before, the other way round
+# too. A clip watched again or a song played twice matched far away at z 9 to
+# 22 and at the right offset almost as well, 0.81 to 0.97 of that, measured.
+# Next to a real change of a few seconds the old offset still shows z 3 to 8,
+# so a change only counts as a repeat when the old offset is both.
+OLD_Z_MAX = 6.0
+OLD_SHARE_MAX = 0.6
+# Which recording changed is solved for every bin of the first one's time.
+BIN_S = 30
+# A pair's offset is taken to hold this far beyond its last matching window.
+REACH_S = 300
+# The exact place is searched around the bins in 1 s blocks, over lags that
+# cover the two voice groups.
+PLACE_PAD_S = 90
+LAGS = range(-50, 51, 5)
 
 FORMAT = ("bv*[height<=1080][format_note*=Premium]+ba/"
           "bv*[height<=1080]+ba/b[height<=1080]/b")
@@ -307,6 +354,318 @@ def solve(n, pairs):
         pairs.pop(wi)
 
 
+# A map says where a recording is at each moment of the first one (the
+# timeline): a list of (start, end, offset), position = timeline + offset
+# from start to end. One piece for a recording without cuts.
+
+def whole(offset):
+    return [(-np.inf, np.inf, offset)]
+
+
+def from_timeline(m, tau):
+    for t0, t1, o in m:
+        if t0 <= tau < t1:
+            return tau + o
+    return None
+
+
+def clusters(values):
+    """Cluster number per value: sorted, split where SPAN_S lies between."""
+    order = np.argsort(values)
+    out = np.empty(len(values), dtype=int)
+    c = 0
+    for n, ix in enumerate(order):
+        if n and values[ix] - values[order[n - 1]] > SPAN_S:
+            c += 1
+        out[ix] = c
+    return out
+
+
+def runs_of(items, value, min_len):
+    """Items in order grouped into runs of one cluster of value(item). Runs
+    shorter than min_len go, the shortest first, and what they split joins."""
+    if not items:
+        return []
+    lab = clusters(np.array([value(it) for it in items]))
+    runs = []
+    for it, c in zip(items, lab):
+        if runs and runs[-1][0] == c:
+            runs[-1][1].append(it)
+        else:
+            runs.append((c, [it]))
+    while len(runs) > 1:
+        short = [r for r in runs if len(r[1]) < min_len]
+        if not short:
+            break
+        runs.remove(min(short, key=lambda r: len(r[1])))
+        merged = [runs[0]]
+        for r in runs[1:]:
+            if r[0] == merged[-1][0]:
+                merged[-1][1].extend(r[1])
+            else:
+                merged.append(r)
+        runs = merged
+    return [r[1] for r in runs]
+
+
+class Slider:
+    """z of one 60 s window of B at every place in A, the way scan does it."""
+
+    def __init__(self, A, B):
+        self.A = A.astype(np.float64)
+        self.B = B
+        L = WIN_S * FPS
+        nA = self.A.shape[1]
+        self.N = 1 << int(np.ceil(np.log2(nA + L)))
+        self.FA = None
+        energy = np.concatenate([[0], np.cumsum((self.A ** 2).sum(axis=0))])
+        self.valid = nA - L + 1
+        self.sliding = np.sqrt(np.maximum(energy[L:L + self.valid] - energy[:self.valid], 1e-9))
+
+    def z_at(self, w, d):
+        if self.valid <= 0:
+            return 0.0
+        if self.FA is None:
+            self.FA = np.fft.rfft(self.A, n=self.N, axis=1)
+        s = w * HOP_S * FPS
+        win = self.B[:, s:s + WIN_S * FPS].astype(np.float64)
+        c = np.fft.irfft((self.FA * np.conj(np.fft.rfft(win, n=self.N, axis=1))).sum(axis=0),
+                         n=self.N)[:self.valid]
+        ncc = c / (self.sliding * (np.sqrt((win ** 2).sum()) + 1e-9))
+        med = np.median(ncc)
+        z = (ncc - med) / (np.median(np.abs(ncc - med)) * 1.4826 + 1e-12)
+        at = s + int(round(d * FPS))
+        lo, hi = max(0, at - int(0.6 * FPS)), min(len(z), at + int(0.6 * FPS) + 1)
+        return float(z[lo:hi].max()) if hi > lo else 0.0
+
+
+def relation(rows, A, B, log, name):
+    """A pair's offset along B, cuts allowed: [{"u0", "u1", "d", "w"}] in B's
+    own time, time in A = time in B + d from u0 to u1. Nothing is known
+    between two stretches, and short stretches and repeats are left out."""
+    good = [(w, d, z) for w, (d, z) in enumerate(rows) if z >= Z_MIN]
+    runs = runs_of(good, lambda g: g[1], MIN_RUN)
+    slider = Slider(A, B)
+    out = []
+    for run in runs:
+        est = pair_offset([(d, z) for _, d, z in run])
+        if not est:
+            continue
+        if out:
+            prev = out[-1]
+            same = abs(est[0] - prev["d"]) < MIN_JUMP_S
+            if not same:
+                # only windows wholly on their side: a window matches where
+                # its talk is, so the two next to the change can hold some of
+                # both
+                after = run[2:8]
+                before = prev["win"][-8:-2]
+                za = np.median([slider.z_at(w, prev["d"]) for w, _, _ in after]) if after else 99
+                zb = np.median([slider.z_at(w, est[0]) for w, _, _ in before]) if before else 99
+                # what the same windows score where they belong
+                na = np.median([z for _, _, z in after]) if after else 1
+                nb = np.median([z for _, _, z in before]) if before else 1
+                log(f"{name}: {prev['d']:.2f} -> {est[0]:.2f} at {run[0][0] * HOP_S} s, "
+                    f"old offset after z {za:.1f} of {na:.1f}, new one before z {zb:.1f} of {nb:.1f}")
+                same = (za >= OLD_Z_MAX and za >= OLD_SHARE_MAX * na) or \
+                       (zb >= OLD_Z_MAX and zb >= OLD_SHARE_MAX * nb)
+            if same:
+                prev["win"] += run
+                prev["d"], prev["w"] = pair_offset([(d, z) for _, d, z in prev["win"]]) \
+                    or (prev["d"], prev["w"])
+                continue
+        out.append({"win": list(run), "d": est[0], "w": est[1]})
+    for n, r in enumerate(out):
+        r["u0"] = r["win"][0][0] * HOP_S + HOP_S / 2 if n else -np.inf
+        r["u1"] = r["win"][-1][0] * HOP_S + WIN_S - HOP_S / 2 if n < len(out) - 1 else np.inf
+        r["k0"] = r["win"][0][0] * HOP_S - REACH_S
+        r["k1"] = r["win"][-1][0] * HOP_S + WIN_S + REACH_S
+    return out
+
+
+def relation_at(rel, u):
+    for r in rel:
+        if r["u0"] <= u < r["u1"] and r["k0"] <= u < r["k1"]:
+            return r
+    return None
+
+
+def offsets_per_bin(n, rels, maps, lo, hi):
+    """Every recording's offset in every bin of the timeline, solved from the
+    pairs' offsets that hold there: {k: [(timeline, offset)]}."""
+    out = {}
+    for tau in np.arange(lo, hi, BIN_S):
+        pairs = []
+        for (i, j), rel in rels.items():
+            u = from_timeline(maps[j], tau)
+            if u is None or from_timeline(maps[i], tau) is None:
+                continue
+            r = relation_at(rel, u)
+            if r:
+                pairs.append((i, j, -r["d"], r["w"]))
+        if not pairs:
+            continue
+        x, linked = solve(n, pairs)
+        for k in linked - {0}:
+            out.setdefault(k, []).append((float(tau), float(x[k])))
+    return out
+
+
+def blocks(P, K, k0, n):
+    """How well K from frame k0 follows P, per 1 s block over n blocks, the
+    best of small lags."""
+    def take(f0):
+        out = np.zeros((K.shape[0], n * FPS), dtype=np.float32)
+        a, b = max(f0, 0), min(f0 + n * FPS, K.shape[1])
+        if b > a:
+            out[:, a - f0:b - f0] = K[:, a:b]
+        return out
+    ep = (P ** 2).sum(axis=0).reshape(n, FPS).sum(axis=1)
+    best = np.zeros(n)
+    for lag in LAGS:
+        q = take(k0 + lag)
+        num = (P * q).sum(axis=0).reshape(n, FPS).sum(axis=1)
+        eq = (q ** 2).sum(axis=0).reshape(n, FPS).sum(axis=1)
+        best = np.maximum(best, num / np.sqrt(ep * eq + 1e-9))
+    return best
+
+
+def along(F, m, lo, n):
+    """Recording F under map m second by second from timeline lo, silence
+    where the map has nothing."""
+    out = np.zeros((F.shape[0], n * FPS), dtype=np.float32)
+    for b in range(n):
+        own = from_timeline(m, lo + b)
+        if own is None:
+            continue
+        f = int(round(own * FPS))
+        a, e = max(f, 0), min(f + FPS, F.shape[1])
+        if e > a:
+            out[:, b * FPS + a - f:b * FPS + e - f] = F[:, a:e]
+    return out
+
+
+def place(k, a, b, lo, hi, maps, feats, partners):
+    """Where on the timeline between lo and hi recording k leaves offset a for
+    offset b. For b > a its stretch in between was put in and is jumped over,
+    for b < a a stretch is missing and k waits a - b seconds."""
+    n = int(hi - lo)
+    ga, gb = np.zeros(n), np.zeros(n)
+    for p in partners:
+        P = along(feats[p], maps[p], lo, n)
+        ga += blocks(P, feats[k], int(round((lo + a) * FPS)), n)
+        gb += blocks(P, feats[k], int(round((lo + b) * FPS)), n)
+    ca = np.concatenate([[0], np.cumsum(ga)])
+    cb = np.concatenate([[0], np.cumsum(gb)])
+    gap = int(round(max(a - b, 0)))
+    best, at = -np.inf, 0
+    for t in range(0, max(n - gap, 0) + 1):
+        s = ca[t] + cb[n] - cb[min(t + gap, n)]
+        if s > best:
+            best, at = s, t
+    return lo + at
+
+
+def cut_maps(n, x, linked, rows, feats, log):
+    """Maps for the recordings that were cut or had something put in, from
+    the pairs' offsets along the way. Rounds until the maps stop changing,
+    each placing the pairs on the timeline through the maps before it."""
+    rels = {}
+    for (i, j), r in rows.items():
+        rels[i, j] = relation(r, feats[i], feats[j], log, f"pair {i}+{j}")
+    if all(len(rel) < 2 for rel in rels.values()):
+        return {}
+    maps = {k: whole(float(x[k])) for k in linked}
+    maps[0] = whole(0.0)
+    # the first recording's time is the whole timeline
+    end = feats[0].shape[1] / FPS
+    for _ in range(3):
+        per_bin = offsets_per_bin(n, rels, maps, 0.0, end)
+        stretches = {k: stretches_of(per_bin.get(k, [])) for k in linked - {0}}
+        nxt = {0: maps[0]}
+        nxt.update(place_all(stretches, maps, rels, feats, x, log))
+        if nxt == maps:
+            break
+        maps = nxt
+    return {k: m for k, m in maps.items() if k and len(m) > 1}
+
+
+def stretches_of(seq):
+    """Where on the timeline one offset holds for a recording, from its
+    offsets per bin: [{"t0", "t1", "off"}], first and last bin."""
+    out = []
+    for run in runs_of(seq, lambda s: s[1], 2):
+        off = float(np.median([s[1] for s in run]))
+        if out and abs(off - out[-1]["off"]) < MIN_JUMP_S:
+            out[-1]["t1"] = run[-1][0]
+            continue
+        out.append({"t0": run[0][0], "t1": run[-1][0], "off": off})
+    return out
+
+
+def place_all(stretches, maps, rels, feats, x, log):
+    """Every change placed exactly, and the maps that follow."""
+    changes = []
+    for k, st in stretches.items():
+        for a, b in zip(st, st[1:]):
+            jump = abs(b["off"] - a["off"])
+            changes.append({"k": k, "a": a["off"], "b": b["off"],
+                            "lo": a["t1"] - PLACE_PAD_S - jump,
+                            "hi": b["t0"] + PLACE_PAD_S + jump})
+
+    def overlaps(c, d):
+        return c["lo"] < d["hi"] and d["lo"] < c["hi"]
+
+    for c in changes:
+        # a change every other recording makes too, by as much, is one in
+        # the first recording: only that one is known to run straight
+        # through it, the others agree with each other on any place
+        same = [d for d in changes if d is not c and overlaps(c, d)
+                and abs((d["b"] - d["a"]) - (c["b"] - c["a"])) < 1.0]
+        c["group"] = same
+        busy = {d["k"] for d in changes if d is not c and overlaps(c, d)}
+        partners = [p for p in maps if p != c["k"] and p not in busy and
+                    rels.get((min(p, c["k"]), max(p, c["k"])))]
+        c["at"] = place(c["k"], c["a"], c["b"], c["lo"], c["hi"], maps, feats, partners) \
+            if partners else None
+    for c in changes:
+        # a change shared by several recordings happens at one place
+        places = [d["at"] for d in [c] + c["group"] if d["at"] is not None]
+        c["at"] = float(np.median(places)) if places else (c["lo"] + c["hi"]) / 2
+    out = {}
+    for k, st in stretches.items():
+        mine = [c for c in changes if c["k"] == k]
+        if not mine:
+            out[k] = whole(float(x[k]))
+            continue
+        m, start = [], -np.inf
+        for c in mine:
+            m.append((start, c["at"], c["a"]))
+            start = c["at"] + max(c["a"] - c["b"], 0.0)
+            log(f"recording {k}: from {c['a']:.2f} to {c['b']:.2f} at {c['at']:.0f} s")
+        m.append((start, np.inf, mine[-1]["b"]))
+        out[k] = m
+    return out
+
+
+def pieces(m, duration):
+    """A map as the parts a player opens, on the timeline from 0: [{"from",
+    "to", "at"}], "at" where in the recording the part starts, "to" None when
+    it runs to the recording's end. Parts before its start or after its end
+    are left out, and black fills the timeline between parts."""
+    end = np.inf if duration is None else float(duration)
+    out = []
+    for t0, t1, o in m:
+        a = max(t0, -o, 0.0)
+        b = min(t1, end - o)
+        if b <= a:
+            continue
+        out.append({"from": round(float(a), 3),
+                    "to": None if b >= end - o else round(float(b), 3),
+                    "at": round(float(a + o), 3)})
+    return out
+
+
 def ensure_blank():
     path = os.path.join(CACHE, "blank.mkv")
     if os.path.exists(path):
@@ -365,15 +724,22 @@ def main():
             list(pool.map(prepare, range(n)))
 
     ok = [k for k in range(n) if feats[k] is not None]
-    pairs = []
+    pairs, rows = [], {}
     todo = [(i, j) for i in ok for j in ok if i < j]
     for c, (i, j) in enumerate(todo):
         progress(f"matching {c + 1}/{len(todo)}")
-        est = pair_offset(pair_rows(ids[i], ids[j], feats[i], feats[j]))
+        rows[i, j] = pair_rows(ids[i], ids[j], feats[i], feats[j])
+        est = pair_offset(rows[i, j])
         if est:
             # time in i = time in j + d, so x_j - x_i = -d
             pairs.append((i, j, -est[0], est[1]))
     x, linked = solve(n, pairs) if 0 in ok else (np.zeros(n), set())
+    maps = {}
+    if len(linked) > 1:
+        progress("looking for cuts")
+        rows = {p: r for p, r in rows.items() if p[0] in linked and p[1] in linked}
+        maps = cut_maps(n, x, linked, rows, feats,
+                        lambda t: print("cuts " + t, file=sys.stderr, flush=True))
 
     videos = []
     for k in range(n):
@@ -389,7 +755,9 @@ def main():
             "video": video, "audio": audio,
             "error": errors[k],
         })
-    later = any(v["matched"] and v["offset"] < 0 for v in videos)
+        if k in maps:
+            videos[-1]["pieces"] = pieces(maps[k], info.get("duration"))
+    later = any(v["matched"] and (v["offset"] < 0 or "pieces" in v) for v in videos)
     json.dump({"videos": videos, "blank": ensure_blank() if later else None,
                "blank_secs": BLANK_SECS}, sys.stdout)
     sys.stdout.write("\n")

@@ -18,6 +18,15 @@
 -- seeked to or played through. An EDL cannot open mpv's av://lavfi sources,
 -- which is why the black part is a real file.
 --
+-- A recording that was cut or had something put in comes with parts (how
+-- they are found is written in the helper), and its EDL plays each part of
+-- the stream where it belongs, black where it lacks something. Measured on
+-- local files whose frames carry their number: every view showed the leader's
+-- frame on both sides of a missing minute and of a skipped 45 s, seeked to and
+-- played through. On four YouTube streams a skip played through without a
+-- stall, and black in and out cost the same few dropped frames as the black
+-- before a later view.
+--
 -- THE PICTURE. --lavfi-complex scales every view and lays it on a black canvas
 -- the size of the display. The canvas is as big as the screen, so the ArtCNN
 -- shaders see no upscaling and skip themselves (their WHEN wants 1.3x).
@@ -332,7 +341,7 @@ local function draw_labels(show)
     end
     if away and views[away] then
         -- bottom left above the seek bar's strip, clear of the view labels
-        -- (top centre ran into the top right view's label with three views)
+        -- (top centre would run into the top right view's label with three views)
         local text = ("%d  %s  on %s%s"):format(away, views[away].name, o.screen,
                                                away == heard and "  ♪" or "")
         local bottom = math.min(p.y + p.h, p.oh * (1 - o.bar))
@@ -737,22 +746,56 @@ local function esc(s)
     return "%" .. #s .. "%" .. s
 end
 
+-- a track made of parts of one stream, each { from, to, at }: from `from` to
+-- `to` on the leader's clock it plays the stream from `at` on, the last one
+-- (to = nil) until the stream ends. Black and silence fill the time before
+-- the first part and between parts.
+local function pieced(url, parts, blank, blank_secs)
+    local out = { "!no_chapters" }
+    local now = 0
+    for n, p in ipairs(parts) do
+        local gap = p.from - now
+        while gap > 0.0005 do
+            local len = math.min(gap, blank_secs)
+            out[#out + 1] = ("%s,length=%.3f"):format(esc(blank), len)
+            gap = gap - len
+        end
+        local part = ("%s,start=%.3f"):format(esc(url), p.at)
+        if p.to then part = part .. (",length=%.3f"):format(p.to - p.from) end
+        -- the tracks are the stream's, not the black file's
+        if n == 1 then part = part .. ",layout=this" end
+        out[#out + 1] = part
+        if not p.to then break end
+        now = p.to
+    end
+    return "edl://" .. table.concat(out, ";")
+end
+
 -- a track that starts `offset` seconds into its stream, or after -offset
 -- seconds of black and silence when it started later than the leader
 local function shifted(url, offset, blank, blank_secs)
-    local parts = { "!no_chapters" }
-    if offset >= 0 then
-        parts[#parts + 1] = ("%s,start=%.3f,layout=this"):format(esc(url), offset)
-    else
-        local gap = -offset
-        while gap > 0.0005 do
-            local len = math.min(gap, blank_secs)
-            parts[#parts + 1] = ("%s,length=%.3f"):format(esc(blank), len)
-            gap = gap - len
+    return pieced(url, { { from = math.max(0, -offset), at = math.max(0, offset) } },
+                  blank, blank_secs)
+end
+
+local function clock(secs)
+    secs = math.floor(secs + 0.5)
+    local h, m, s = math.floor(secs / 3600), math.floor(secs / 60) % 60, secs % 60
+    return h > 0 and ("%d:%02d:%02d"):format(h, m, s) or ("%d:%02d"):format(m, s)
+end
+
+-- what a recording with cuts does where, for the message about it
+local function changes(parts)
+    local out = {}
+    for n = 2, #parts do
+        local a, b = parts[n - 1], parts[n]
+        if b.from > a.to + 0.5 then
+            out[#out + 1] = ("black %s to %s"):format(clock(a.to), clock(b.from))
+        else
+            out[#out + 1] = ("skips %s at %s"):format(clock(b.at - a.at - (a.to - a.from)), clock(a.to))
         end
-        parts[#parts + 1] = esc(url) .. ",layout=this"
     end
-    return "edl://" .. table.concat(parts, ";")
+    return table.concat(out, ", ")
 end
 
 local function track_id(kind, file)
@@ -819,8 +862,16 @@ local function add_tracks(result)
                     :format(short_name(r), hint), 8)
             elseif r.video and #views + #added < MAX_VIEWS then
                 local v = { url = r.url, name = short_name(r), offset = r.offset }
-                v.vedl = shifted(r.video, r.offset, result.blank, result.blank_secs)
-                v.aedl = r.audio and shifted(r.audio, r.offset, result.blank, result.blank_secs)
+                if r.pieces and #r.pieces > 1 then
+                    v.vedl = pieced(r.video, r.pieces, result.blank, result.blank_secs)
+                    v.aedl = r.audio and pieced(r.audio, r.pieces, result.blank, result.blank_secs)
+                    local text = ("POV: %s was edited, kept in step: %s"):format(v.name, changes(r.pieces))
+                    msg.info(text)
+                    mp.osd_message(text, 8)
+                else
+                    v.vedl = shifted(r.video, r.offset, result.blank, result.blank_secs)
+                    v.aedl = r.audio and shifted(r.audio, r.offset, result.blank, result.blank_secs)
+                end
                 added[#added + 1] = v
             end
         end
