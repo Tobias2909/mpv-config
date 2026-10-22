@@ -40,6 +40,14 @@
 --     file when the graph is built. Without the files a seek brought the old
 --     layout back, with them not one frame of it.
 --
+-- PICTURE IN PICTURE. One view fills the screen and every other one sits in a
+-- box over it, moved by dragging and sized by its corners. Which view lies
+-- over which is the order of the overlays in the graph, and a new order would
+-- mean a new graph. So every view goes in twice from its one scale: once
+-- under all the others and once over them, and the copy not in use waits
+-- right of the canvas, where overlay draws nothing of it. Making another view
+-- the big one then only moves copies, like any other layout.
+--
 -- SOUND. One view is heard at a time. Its audio track is selected like any
 -- other, which leaves the other views silent. `aid` is in mpv's
 -- watch-later-options, so it is taken out of them while views play: otherwise
@@ -51,9 +59,11 @@
 -- keeps one. Both come back when the file ends.
 --
 -- Keys while views play: 1 to 9 make that view big and play its sound, the
--- same key again or 0 shows all views the same size, Alt+1 to Alt+9 only
--- switch the sound, Ctrl+1 to Ctrl+9 put that view on the other screen, the
--- same key again or Ctrl+0 brings it back.
+-- same key again or 0 shows all views the same size, p puts the heard view
+-- over the whole screen and the others in boxes (p again or 0 ends it, 1 to 9
+-- there change which view is big), Alt+1 to Alt+9 only switch the sound,
+-- Ctrl+1 to Ctrl+9 put that view on the other screen, the same key again or
+-- Ctrl+0 brings it back.
 --
 -- TWO SCREENS. A view on the other screen is played by a second mpv in a
 -- window of its own, kept in step with this one by follower.lua (how is
@@ -63,7 +73,9 @@
 -- as if pressed here, so both windows answer the same keys.
 --
 -- DRAGGING. A view dragged onto another trades places with it, in whichever
--- layout is showing, and each layout keeps its own order. The clicks come
+-- layout is showing, and each layout keeps its own order. A box in picture in
+-- picture moves instead, so there the big view is dragged onto a box to
+-- trade. Where the boxes are is kept between runs. The clicks come
 -- from an input section over the picture. The section enabled last wins
 -- where areas overlap (measured), so this one leaves out the bottom strip
 -- where ModernZ's seek bar sits, and says so with `input-section-raised`,
@@ -92,6 +104,9 @@ local ffi     = require 'ffi'
 local o = {
     -- share of the width the big view takes
     focus = 0.75,
+    -- share of the width a picture in picture box starts at, and its least
+    pip = 0.25,
+    pip_min = 0.1,
     -- demuxer cache per stream and direction while views play
     cache_mib = 1024,
     -- seconds the view names stay on screen after a change
@@ -133,14 +148,23 @@ local views = {}        -- on screen: { url, name, offset, vid, aid }, [1] is th
 local job = nil         -- running helper
 local again = false     -- urls arrived while the helper ran
 local pending = {}      -- async track adds still running
-local mode = "grid"     -- "grid" all the same size, "focus" place 1 big
-local order = { grid = {}, focus = {} }   -- per layout, place -> view index
+local mode = "grid"     -- "grid" all the same size, "focus" place 1 big,
+                        -- "pip" place 1 over all, the others in boxes
+local order = { grid = {}, focus = {}, pip = {} }   -- per layout, place -> view index
 local heard = 1         -- index of the view whose sound plays
 local saved = nil       -- options changed while views play
 local canvas = nil      -- { w, h } the graph was built for
 local tiles = nil       -- current layout, per view index: { x, y, w, h }
 local slots = nil       -- the same rectangles, per place
 local drag = nil        -- a held view: { from, to } places
+local hand = nil        -- a held box: { k, place, corner, mx, my, b, timer }
+local hover = nil       -- "k:corner" of the box corner under the pointer
+local boxes = {}        -- place -> { x, y, w } shares of the canvas, picture in picture
+local box_timer = nil
+local sent = {}         -- what the running graph was last told, "target setting " -> value
+local labels_on = false
+local chrome, chrome_to = 0, 0          -- how much of the boxes' frames shows
+local chrome_timer, nap_timer = nil, nil
 local placed = {}       -- place -> view index, the views on the TV only
 local away = nil        -- index of the view on the other screen
 local second = nil      -- the player showing it (follower.lua)
@@ -151,6 +175,14 @@ local label_timer = nil
 local progress_timer = nil
 local add_timer = nil   -- adds that come in quick succession go to one helper run
 local ADD_WAIT = 1.5
+-- The boxes look like the chat box: a line and four corners in its colour,
+-- sizes in units of a 1080 high screen, shown on any pointer move and gone
+-- after `nap` seconds of stillness.
+local UI = { accent = "&HFF5C7C&", grip = 8, grip_in = 14, grip_out = 5,
+             nap = 2.6, fade = 0.18, frame = 1 / 60 }
+local CORNERS = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } }
+local BOX_FILE = (os.getenv("XDG_STATE_HOME") or ((os.getenv("HOME") or ".") .. "/.local/state"))
+                 .. "/mpv/pov-pip.json"
 
 -- read by the wrapper and the h sheet
 local function publish()
@@ -258,6 +290,82 @@ local function focus_tiles(n, W, H)
     return out
 end
 
+-- the first box bottom right above the seek bar's strip, the next ones
+-- above it, then in a column further left
+local function default_box(s, W, H)
+    local bw = o.pip * W
+    local bh = bw * 9 / 16
+    local gap = 0.02 * H
+    local bottom = (1 - o.bar) * H - gap
+    local rows = math.max(1, math.floor(bottom / (bh + gap)))
+    local col, row = math.floor((s - 2) / rows), (s - 2) % rows
+    local x = W - gap - (col + 1) * bw - col * gap
+    local y = bottom - (row + 1) * bh - row * gap
+    return { x = math.max(0, x) / W, y = math.max(0, y) / H, w = o.pip }
+end
+
+-- a box in canvas pixels, 16:9, on the canvas and above the seek bar's strip
+-- so that it can always be taken
+local function box_px(b, W, H)
+    local ymax = (1 - o.bar) * H
+    local w = even(math.min(math.max(b.w, o.pip_min), 1) * W)
+    local h = even(w * 9 / 16)
+    if h > ymax then h = even(ymax); w = even(h * 16 / 9) end
+    local x = even(math.min(math.max(b.x * W, 0), W - w))
+    local y = even(math.min(math.max(b.y * H, 0), ymax - h))
+    return { x = x, y = y, w = w, h = h, top = true }
+end
+
+-- place 1 over the whole canvas, every other place in its box over it
+local function pip_tiles(n, W, H)
+    local bw, bh = W, even(W * 9 / 16)
+    if bh > H then bh = H; bw = even(H * 16 / 9) end
+    local out = { { x = even((W - bw) / 2), y = even((H - bh) / 2), w = bw, h = bh } }
+    for s = 2, n do
+        boxes[s] = boxes[s] or default_box(s, W, H)
+        out[s] = box_px(boxes[s], W, H)
+    end
+    return out
+end
+
+local function load_boxes()
+    local list = utils.parse_json(read_file(BOX_FILE) or "")
+    if type(list) ~= "table" then return end
+    for i, b in ipairs(list) do
+        if type(b) ~= "table" or not (tonumber(b.x) and tonumber(b.y) and tonumber(b.w)) then break end
+        boxes[i + 1] = { x = tonumber(b.x), y = tonumber(b.y), w = tonumber(b.w) }
+    end
+end
+
+local function write_boxes()
+    local list = {}
+    for s = 2, MAX_VIEWS do
+        if not boxes[s] then break end
+        list[#list + 1] = boxes[s]
+    end
+    local text = utils.format_json(list)
+    if not write_file(BOX_FILE, text) then
+        spawn.wait({ "mkdir", "-p", BOX_FILE:match("^(.*)/") })
+        write_file(BOX_FILE, text)
+    end
+end
+
+-- written a second after the last change, so a drag is one write
+local function save_boxes()
+    if box_timer then box_timer:kill() end
+    box_timer = mp.add_timeout(1, function()
+        box_timer = nil
+        write_boxes()
+    end)
+end
+
+local function flush_boxes()
+    if not box_timer then return end
+    box_timer:kill()
+    box_timer = nil
+    write_boxes()
+end
+
 -- the views the TV shows, in the order they go into the graph
 local function on_tv()
     local list = {}
@@ -276,11 +384,16 @@ local function compute_tiles()
     local n = #placed
     if mode == "focus" and n > 1 then
         slots = focus_tiles(n, canvas.w, canvas.h)
+    elseif mode == "pip" and n > 1 then
+        slots = pip_tiles(n, canvas.w, canvas.h)
     else
         slots = grid_tiles(n, canvas.w, canvas.h)
     end
     tiles = {}
-    for s, k in ipairs(placed) do tiles[k] = slots[s] end
+    for s, k in ipairs(placed) do
+        tiles[k] = slots[s]
+        slots[s].place = s
+    end
 end
 
 ---------------------------------------------------------------- labels
@@ -310,20 +423,65 @@ local function frame_path(x, y, w, h, b)
                           box_path(x, y, b, h), box_path(x + w - b, y, b, h) }, " ")
 end
 
-local function draw_labels(show)
+-- ASS alpha of an opacity
+local function ab(v)
+    return math.floor(255 * (1 - v) + 0.5)
+end
+
+-- the boxes' frames and corners, a held or pointed at corner in full
+local function draw_boxes(p, ev)
+    local lit = hand and 1 or chrome
+    local g = math.max(4, math.floor(UI.grip * p.oh / 1080 + 0.5))
+    for _, k in ipairs(on_tv()) do
+        local t = tiles[k]
+        if t and t.top then
+            local x, y, w, h = on_screen(p, t)
+            if lit > 0 then
+                ev[#ev + 1] = ("{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\1a&H%02X&\\p1}%s")
+                    :format(UI.accent, ab(lit), frame_path(x, y, w, h, 1))
+            end
+            for c, a in ipairs(CORNERS) do
+                local on = hover == k .. ":" .. c or (hand and hand.k == k and hand.corner == a)
+                local ga = on and 1 or 0.6 * lit
+                if ga > 0 then
+                    local gx = a[1] < 0 and x or x + w - g
+                    local gy = a[2] < 0 and y or y + h - g
+                    ev[#ev + 1] = ("{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\1a&H%02X&\\p1}%s")
+                        :format(UI.accent, ab(ga), box_path(gx, gy, g, g))
+                end
+            end
+        end
+    end
+end
+
+-- the view names (for a while after a change), the boxes' chrome and what a
+-- held view would trade with
+local function draw()
     local p = picture()
-    if not show or not tiles or not p then
+    local boxed = mode == "pip" and (hand or hover or chrome > 0)
+    if not tiles or not p or not (labels_on or drag or boxed) then
         overlay:remove()
         return
     end
     overlay.res_x, overlay.res_y = p.ow, p.oh
     local fs = math.max(16, math.floor(p.oh / 40))
     local ev = {}
+    if boxed then draw_boxes(p, ev) end
     if drag then
         -- the held view dimmed, the place it would go framed
         local x, y, w, h = on_screen(p, slots[drag.from])
+        local shape = box_path(x, y, w, h)
+        for s, t in ipairs(slots) do
+            if t.top and s ~= drag.from then
+                -- the boxes over it stay clear: the same square drawn the
+                -- other way round is a hole
+                local bx, by, bw, bh = on_screen(p, t)
+                shape = shape .. (" m %d %d l %d %d l %d %d l %d %d")
+                    :format(bx, by, bx, by + bh, bx + bw, by + bh, bx + bw, by)
+            end
+        end
         ev[#ev + 1] = ("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H60&\\p1}%s{\\p0}")
-            :format(box_path(x, y, w, h))
+            :format(shape)
         if drag.to and drag.to ~= drag.from then
             x, y, w, h = on_screen(p, slots[drag.to])
             ev[#ev + 1] = ("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&H00&\\p1}%s{\\p0}")
@@ -332,14 +490,14 @@ local function draw_labels(show)
     end
     for k, v in ipairs(views) do
         local t = tiles[k]
-        if t then
+        if t and (labels_on or drag) then
             local x, y = on_screen(p, t)
             local text = k .. "  " .. v.name .. (k == heard and "  ♪" or "")
             ev[#ev + 1] = ("{\\an7\\pos(%d,%d)\\fs%d\\bord3\\shad0\\1c&HFFFFFF&\\3c&H000000&}%s")
                 :format(x + math.floor(fs / 2), y + math.floor(fs / 3), fs, text)
         end
     end
-    if away and views[away] then
+    if away and views[away] and (labels_on or drag) then
         -- bottom left above the seek bar's strip, clear of the view labels
         -- (top centre would run into the top right view's label with three views)
         local text = ("%d  %s  on %s%s"):format(away, views[away].name, o.screen,
@@ -353,22 +511,73 @@ local function draw_labels(show)
 end
 
 local function flash_labels()
-    draw_labels(true)
+    labels_on = true
+    draw()
     if label_timer then label_timer:kill() end
-    label_timer = mp.add_timeout(o.label_secs, function() draw_labels(false) end)
+    label_timer = mp.add_timeout(o.label_secs, function()
+        labels_on = false
+        draw()
+    end)
+end
+
+-- the boxes' chrome fades in and out rather than blink
+local function fade_to(to)
+    chrome_to = to
+    if chrome_timer then return end
+    chrome_timer = mp.add_periodic_timer(UI.frame, function()
+        local step = UI.frame / UI.fade
+        if chrome < chrome_to then
+            chrome = math.min(chrome_to, chrome + step)
+        else
+            chrome = math.max(chrome_to, chrome - step)
+        end
+        if chrome == chrome_to then
+            chrome_timer:kill()
+            chrome_timer = nil
+        end
+        draw()
+    end)
+end
+
+-- movement brings the chrome back and stillness takes it away, not while a
+-- box is held; a new timer per movement, kill() and resume() would carry on
+-- from the time already run
+local function wake()
+    if mode ~= "pip" or not saved then return end
+    if chrome_to ~= 1 then fade_to(1) end
+    if nap_timer then nap_timer:kill() end
+    nap_timer = mp.add_timeout(UI.nap, function()
+        nap_timer = nil
+        if hand then wake() else fade_to(0) end
+    end)
 end
 
 ---------------------------------------------------------------- graph
+
+-- where view k's two copies go: the one under the others (o) and the one
+-- over them (p), the copy not in use right of the canvas
+local function spots(t)
+    if t.top then return canvas.w, 0, t.x, t.y end
+    return t.x, t.y, canvas.w, 0
+end
+
+-- the commands that put view k where its tile is, the scale first
+local function commands(k, t)
+    local ox, oy, px, py = spots(t)
+    return { ("scale@s%d w %d"):format(k, t.w), ("scale@s%d h %d"):format(k, t.h),
+             ("overlay@o%d x %d"):format(k, ox), ("overlay@o%d y %d"):format(k, oy),
+             ("overlay@p%d x %d"):format(k, px), ("overlay@p%d y %d"):format(k, py) }
+end
 
 -- what each input's sendcmd reads when the graph is built
 local function write_layout_files()
     local first = {}
     for k, t in pairs(tiles) do
-        first[#first + 1] = ("overlay@o%d x %d, overlay@o%d y %d"):format(k, t.x, k, t.y)
+        first[#first + 1] = table.concat(commands(k, t), ", ", 3)
     end
     local head = on_tv()[1]
     for k, t in pairs(tiles) do
-        local cmds = ("scale@s%d w %d, scale@s%d h %d"):format(k, t.w, k, t.h)
+        local cmds = table.concat(commands(k, t), ", ", 1, 2)
         if k == head then cmds = cmds .. ", " .. table.concat(first, ", ") end
         write_file(("%s/layout%d.cmd"):format(RUN, k), "0 " .. cmds .. ";\n")
     end
@@ -389,15 +598,19 @@ local function zmq_close()
 end
 
 -- every command goes out at once, the filter applies all of them before the
--- next frame; the answers are read and dropped
+-- next frame; the answers are read and dropped. Only what changed is sent,
+-- so a box carried around does not set every scale anew each frame.
 local function zmq_send_layout()
     if not zsock then return end
     while zmq.zmq_recv(zsock, zbuf, 256, ZMQ_DONTWAIT) >= 0 do end
     for k, t in pairs(tiles) do
-        for _, c in ipairs({ ("scale@s%d w %d"):format(k, t.w), ("scale@s%d h %d"):format(k, t.h),
-                             ("overlay@o%d x %d"):format(k, t.x), ("overlay@o%d y %d"):format(k, t.y) }) do
-            zmq.zmq_send(zsock, "", 0, ZMQ_SNDMORE + ZMQ_DONTWAIT)
-            zmq.zmq_send(zsock, c, #c, ZMQ_DONTWAIT)
+        for _, c in ipairs(commands(k, t)) do
+            local key, value = c:match("^(.* )(%S+)$")
+            if sent[key] ~= value then
+                sent[key] = value
+                zmq.zmq_send(zsock, "", 0, ZMQ_SNDMORE + ZMQ_DONTWAIT)
+                zmq.zmq_send(zsock, c, #c, ZMQ_DONTWAIT)
+            end
         end
     end
 end
@@ -411,22 +624,31 @@ local function build_graph()
         -- no format filter after the scale: overlay takes yuva420p only, and a
         -- conversion libavfilter adds by itself keeps the size it was built
         -- with, which undid every live resize (measured)
-        local scale = ("scale@s%d=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1")
-            :format(k, t.w, t.h)
+        local scale = ("scale@s%d=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1,split[v%d][w%d]")
+            :format(k, t.w, t.h, k, k)
         local cmd = ("sendcmd=f='%s/layout%d.cmd'"):format(RUN, k)
         if i == 1 then
             p[#p + 1] = ("[vid%d]%s,split[canvas][src%d]"):format(v.vid, cmd, k)
             p[#p + 1] = ("[canvas]scale=2:2,pad=%d:%d:0:0:black,setsar=1,format=yuv420p[bg0]")
                 :format(canvas.w, canvas.h)
-            p[#p + 1] = ("[src%d]%s[v%d]"):format(k, scale, k)
+            p[#p + 1] = ("[src%d]%s"):format(k, scale)
         else
-            p[#p + 1] = ("[vid%d]%s,%s[v%d]"):format(v.vid, cmd, scale, k)
+            p[#p + 1] = ("[vid%d]%s,%s"):format(v.vid, cmd, scale)
         end
     end
-    for i, k in ipairs(list) do
-        local t = tiles[k]
-        local tail = i == n and (",zmq=b='ipc\\://%s'[vo]"):format(ENDPOINT) or ("[bg%d]"):format(i)
-        p[#p + 1] = ("[bg%d][v%d]overlay@o%d=x=%d:y=%d:eof_action=pass%s"):format(i - 1, k, k, t.x, t.y, tail)
+    -- every copy under the others first, then every copy over them
+    local b = 0
+    for layer, l in ipairs({ { pad = "v", name = "o" }, { pad = "w", name = "p" } }) do
+        for i, k in ipairs(list) do
+            local ox, oy, px, py = spots(tiles[k])
+            local x, y = ox, oy
+            if layer == 2 then x, y = px, py end
+            local tail = (layer == 2 and i == n) and (",zmq=b='ipc\\://%s'[vo]"):format(ENDPOINT)
+                         or ("[bg%d]"):format(b + 1)
+            p[#p + 1] = ("[bg%d][%s%d]overlay@%s%d=x=%d:y=%d:eof_action=pass%s")
+                :format(b, l.pad, k, l.name, k, x, y, tail)
+            b = b + 1
+        end
     end
     return table.concat(p, ";")
 end
@@ -442,24 +664,56 @@ end
 ---------------------------------------------------------------- mouse
 
 -- the picture without the seek bar's strip, the whole window while a view
--- is held so the release is caught wherever it happens
+-- or a box is held so the release is caught wherever it happens
 local function area_sync()
     local p = picture()
     if not saved or not p then return end
     local x0, y0, x1, y1 = 0, 0, p.ow, p.oh
-    if not drag then
+    if not drag and not hand then
         x0, y0 = p.x, p.y
         x1, y1 = p.x + p.w, math.min(p.y + p.h, p.oh * (1 - o.bar))
     end
     mp.set_mouse_area(math.floor(x0), math.floor(y0), math.ceil(x1), math.ceil(y1), SECTION)
 end
 
+-- the place under a point; boxes lie over the big view, and of two boxes
+-- the one whose view comes later in the graph lies over the other
 local function slot_at(m)
     local p = picture()
-    if not p or not slots or type(m) ~= "table" then return nil end
-    for s, t in ipairs(slots) do
-        local x, y, w, h = on_screen(p, t)
-        if m.x >= x and m.x < x + w and m.y >= y and m.y < y + h then return s end
+    if not p or not tiles or type(m) ~= "table" then return nil end
+    local list = on_tv()
+    for _, over in ipairs({ true, false }) do
+        for i = #list, 1, -1 do
+            local t = tiles[list[i]]
+            if t and (t.top or false) == over then
+                local x, y, w, h = on_screen(p, t)
+                if m.x >= x and m.x < x + w and m.y >= y and m.y < y + h then return t.place end
+            end
+        end
+    end
+end
+
+-- the box under a point and the corner of it there, if any; corners reach a
+-- little outside the box, like the chat box's
+local function box_at(m)
+    local p = picture()
+    if mode ~= "pip" or not p or not tiles or type(m) ~= "table" then return nil end
+    local gin, gout = UI.grip_in * p.oh / 1080, UI.grip_out * p.oh / 1080
+    local list = on_tv()
+    for i = #list, 1, -1 do
+        local k = list[i]
+        local t = tiles[k]
+        if t and t.top then
+            local x, y, w, h = on_screen(p, t)
+            for c, a in ipairs(CORNERS) do
+                local x0 = a[1] < 0 and x - gout or x + w - gin
+                local y0 = a[2] < 0 and y - gout or y + h - gin
+                if m.x >= x0 and m.x <= x0 + gin + gout and m.y >= y0 and m.y <= y0 + gin + gout then
+                    return k, c
+                end
+            end
+            if m.x >= x and m.x < x + w and m.y >= y and m.y < y + h then return k end
+        end
     end
 end
 
@@ -471,6 +725,7 @@ local function rebuild()
     canvas = { w = w, h = h }
     compute_tiles()
     write_layout_files()
+    sent = {}
     mp.set_property("lavfi-complex", build_graph())
     publish()
     zmq_connect()
@@ -507,25 +762,50 @@ local function hear(k)
     flash_labels()
 end
 
--- the view goes to the big place, trading with the one there; the big
--- view's own key goes back to equal sizes
+-- a layout's big place: its first one with a view on this screen
+local function big_place(list)
+    local big = 1
+    while list[big] == away do big = big + 1 end
+    return big
+end
+
+-- view k into a layout's big place, trading with the one there
+local function to_big(list, k)
+    local big = big_place(list)
+    for s = 1, #list do
+        if list[s] == k then list[big], list[s] = list[s], list[big] end
+    end
+end
+
+-- the view goes to the big place and is heard; the big view's own key goes
+-- back to equal sizes, except in picture in picture, which p and 0 end
 local function choose(k)
     if not views[k] then return end
     -- the one on the other screen cannot be big here, it is only heard
     if k == away then return hear(k) end
-    local f = order.focus
-    local big = 1
-    while f[big] == away do big = big + 1 end
-    if mode == "focus" and f[big] == k then
+    if mode == "pip" then
+        to_big(order.pip, k)
+    elseif mode == "focus" and order.focus[big_place(order.focus)] == k then
         mode = "grid"
     else
         mode = "focus"
-        for s = 1, #f do
-            if f[s] == k then f[big], f[s] = f[s], f[big] end
-        end
+        to_big(order.focus, k)
     end
     hear(k)
     relayout()
+end
+
+-- the heard view over the whole screen and the others in boxes, again goes
+-- back to equal sizes
+local function pip()
+    if mode == "pip" then
+        mode = "grid"
+    else
+        mode = "pip"
+        if heard ~= away then to_big(order.pip, heard) end
+    end
+    relayout()
+    wake()
 end
 
 ---------------------------------------------------------------- the other screen
@@ -621,16 +901,80 @@ local function send_away(k)
     hear(heard)
 end
 
+-- the boxes where they are now, on the running graph and in the files a
+-- seek builds it from
+local function place_boxes()
+    compute_tiles()
+    write_layout_files()
+    zmq_send_layout()
+    draw()
+end
+
+-- the held box follows the pointer, a corner sizes it from the opposite one,
+-- which stays put; drawn by the hand's timer, not here, as the pointer
+-- reports far more moves a second than there are frames
+local function move_box(m)
+    local p = picture()
+    if not p or type(m) ~= "table" then return end
+    local W, H = canvas.w, canvas.h
+    local ymax = (1 - o.bar) * H
+    local dx, dy = (m.x - hand.mx) * W / p.w, (m.y - hand.my) * H / p.h
+    local b, a = hand.b, hand.corner
+    local w = b.w
+    local x, y = b.x + dx, b.y + dy
+    if a then
+        -- whichever way the pointer went further sizes it, kept 16:9
+        w = math.max(b.w + a[1] * dx, (b.h + a[2] * dy) * 16 / 9)
+        local room_x = a[1] > 0 and W - b.x or b.x + b.w
+        local room_y = a[2] > 0 and ymax - b.y or b.y + b.h
+        w = math.max(o.pip_min * W, math.min(w, room_x, room_y * 16 / 9))
+        x = a[1] > 0 and b.x or b.x + b.w - w
+        y = a[2] > 0 and b.y or b.y + b.h - w * 9 / 16
+    end
+    x = math.min(math.max(x, 0), W - w)
+    y = math.min(math.max(y, 0), ymax - w * 9 / 16)
+    boxes[hand.place] = { x = x / W, y = y / H, w = w / W }
+    hand.moved = true
+end
+
 local function on_down()
-    local s = slot_at(mp.get_property_native("mouse-pos"))
-    if not s or #views < 2 then return end
-    drag = { from = s, to = s }
-    area_sync()
+    if #views < 2 then return end
+    local m = mp.get_property_native("mouse-pos")
+    local k, c = box_at(m)
     if label_timer then label_timer:kill() end
-    draw_labels(true)
+    if k then
+        local t = tiles[k]
+        hand = { k = k, place = t.place, corner = c and CORNERS[c], mx = m.x, my = m.y,
+                 b = { x = t.x, y = t.y, w = t.w, h = t.h } }
+        hand.timer = mp.add_periodic_timer(UI.frame, function()
+            if hand and hand.moved then
+                hand.moved = false
+                place_boxes()
+            end
+        end)
+    else
+        local s = slot_at(m)
+        if not s then return end
+        drag = { from = s, to = s }
+    end
+    labels_on = true
+    area_sync()
+    wake()
+    draw()
 end
 
 local function on_up()
+    if hand then
+        hand.timer:kill()
+        local moved = hand.moved
+        hand = nil
+        area_sync()
+        if moved then place_boxes() end
+        save_boxes()
+        wake()
+        flash_labels()
+        return
+    end
     if not drag then return end
     local d = drag
     drag = nil
@@ -652,11 +996,21 @@ mp.set_key_bindings({ { "mbtn_left", on_up, on_down } }, SECTION, "force")
 mp.set_mouse_area(0, 0, 0, 0, SECTION)
 
 mp.observe_property("mouse-pos", "native", function(_, m)
+    if hand then return move_box(m) end
+    if mode == "pip" and saved then
+        wake()
+        local k, c = box_at(m)
+        local h = c and (k .. ":" .. c) or nil
+        if h ~= hover then
+            hover = h
+            draw()
+        end
+    end
     if not drag then return end
     local s = slot_at(m)
     if s ~= drag.to then
         drag.to = s
-        draw_labels(true)
+        draw()
     end
 end)
 
@@ -666,6 +1020,7 @@ local function bind_keys()
         mp.add_forced_key_binding("Alt+" .. k, "pov-hear-" .. k, function() hear(k) end)
     end
     mp.add_forced_key_binding("0", "pov-grid", function() mode = "grid"; relayout() end)
+    mp.add_forced_key_binding("p", "pov-pip", pip)
     for k = 1, MAX_VIEWS do
         mp.add_forced_key_binding("Ctrl+" .. k, "pov-screen-" .. k, function() send_away(k) end)
     end
@@ -681,10 +1036,12 @@ local function unbind_keys()
         mp.remove_key_binding("pov-hear-" .. k)
     end
     mp.remove_key_binding("pov-grid")
+    mp.remove_key_binding("pov-pip")
     for k = 1, MAX_VIEWS do mp.remove_key_binding("pov-screen-" .. k) end
     mp.remove_key_binding("pov-tv")
     mp.disable_key_bindings(SECTION)
-    drag = nil
+    if hand then hand.timer:kill() end
+    drag, hand, hover = nil, nil, nil
 end
 
 ---------------------------------------------------------------- enter, leave
@@ -731,9 +1088,13 @@ local function leave()
     end
     saved = nil
     zmq_close()
+    flush_boxes()
+    if chrome_timer then chrome_timer:kill() end
+    if nap_timer then nap_timer:kill() end
+    chrome_timer, nap_timer, chrome, chrome_to, labels_on, sent = nil, nil, 0, 0, false, {}
     overlay:remove()
     leader, urls, views, heard, tiles, slots, canvas, again = nil, {}, {}, 1, nil, nil, nil, false
-    mode, order, drag = "grid", { grid = {}, focus = {} }, nil
+    mode, order, drag = "grid", { grid = {}, focus = {}, pip = {} }, nil
     publish()
     remove_dir(RUN)
     -- the zmq filter goes away after the graph does and leaves its socket file
@@ -828,6 +1189,7 @@ local function add_tracks(result)
                 views[#views + 1] = v
                 table.insert(order.grid, #views)
                 table.insert(order.focus, #views)
+                table.insert(order.pip, #views)
             else
                 mp.osd_message("POV: could not open " .. v.name, 5)
             end
@@ -965,7 +1327,7 @@ local function add(url)
         local vid, aid = own_tracks()
         views[1] = { url = leader, vid = vid, aid = aid,
                      name = short_name({ channel = "", title = mp.get_property("media-title") or leader }) }
-        order = { grid = { 1 }, focus = { 1 } }
+        order = { grid = { 1 }, focus = { 1 }, pip = { 1 } }
     end
     mp.osd_message(("POV: %d views, lining them up"):format(#urls + 1), 2)
     if add_timer then add_timer:kill() end
@@ -1034,7 +1396,12 @@ mp.observe_property("display-width", "number", function()
     end
 end)
 
+-- mpv builds the graph anew on a seek, from the layout files, so what it was
+-- told since is gone
+mp.register_event("seek", function() sent = {} end)
+
 mp.register_event("shutdown", leave)
 
 publish()
 sweep()
+load_boxes()

@@ -38,8 +38,9 @@ tuning.
 * **Several points of view** of one gaming session in one window, lined up by the voice chat
   they share and played under one seek bar. In POV mode (Shift+F9) a click adds a view instead
   of replacing the video. A view that was cut afterwards or had a sponsor read put in stays in
-  step past it. Drag a view onto another to swap them, 1 to 9 make one big, and Ctrl+1 to 9
-  move one to a second screen in a player of its own that stays in step
+  step past it. Drag a view onto another to swap them, 1 to 9 make one big, p puts one over
+  the whole screen with the others in boxes that move and size like the chat box, and Ctrl+1
+  to 9 move one to a second screen in a player of its own that stays in step
 * **Key cheat sheet** on h, read from `input.conf`, showing which shader is really active
 * **YouTube Premium** enhanced bitrate, with cookies read live from the browser profile so the
   login never expires, and watched videos land in the YouTube history
