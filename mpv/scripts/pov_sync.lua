@@ -54,9 +54,21 @@
 -- quitting while another view is heard would bring that track number back the
 -- next time the file is opened alone, which is no sound at all.
 --
+-- Seeks are exact while an added view is heard. A seek by the arrow keys or
+-- the wheel normally starts at a keyframe near its target, and mpv starts the
+-- sound there too, but only sound from the same file as the picture. An
+-- added view's sound is a file of its own and started at the target, so
+-- after a seek back that view stayed silent until the picture got there, up
+-- to 4.6 s on a real pair of streams (measured). An exact seek starts picture
+-- and sound at the target, 0.3 to 1.3 s after the key when the target is in
+-- the cache. A keyframe seek back showed the picture after 0.1 to 0.3 s but
+-- the sound only after 0.4 to 4.7 s. The first view's sound comes from the
+-- file of its picture, so with it heard seeks stay as they are: 0.05 to 0.25
+-- s, against 0.2 to 1 s exact.
+--
 -- The filters run on the CPU, so decoding switches to copy back while views
 -- play, and the demuxer cache is cut to cache_mib each way, since every view
--- keeps one. Both come back when the file ends.
+-- keeps one. Both come back when the file ends, and so does hr-seek.
 --
 -- Keys while views play: 1 to 9 make that view big and play its sound, the
 -- same key again or 0 shows all views the same size, p puts the heard view
@@ -756,6 +768,8 @@ local function hear(k)
         if second then second:set("mute", true) end
         mp.set_property_number("aid", v.aid)
     end
+    -- exact seeks for sound from a file of its own, see SOUND
+    if saved then mp.set_property("hr-seek", (k ~= 1 and k ~= away) and "yes" or saved.hr) end
     if second then
         second:show(("%d  %s%s"):format(away, views[away].name, away == heard and "  ♪" or ""), o.label_secs)
     end
@@ -1052,6 +1066,7 @@ local function enter()
         hwdec = mp.get_property("hwdec"),
         fwd = mp.get_property("demuxer-max-bytes"),
         back = mp.get_property("demuxer-max-back-bytes"),
+        hr = mp.get_property("hr-seek"),
     }
     local hw = saved.hwdec
     if hw ~= "no" and not hw:match("copy") then mp.set_property("hwdec", "auto-copy") end
@@ -1083,6 +1098,7 @@ local function leave()
         mp.set_property("hwdec", saved.hwdec)
         mp.set_property("demuxer-max-bytes", saved.fwd)
         mp.set_property("demuxer-max-back-bytes", saved.back)
+        mp.set_property("hr-seek", saved.hr)
         mp.commandv("change-list", "watch-later-options", "append", "aid")
         unbind_keys()
     end
