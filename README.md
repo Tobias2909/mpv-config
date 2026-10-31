@@ -30,8 +30,8 @@ tuning.
 * **Japanese to English subtitles** recognised and translated locally on the GPU, ahead of the
   playback position (F12)
 * **Japanese chat in English** while it scrolls (Shift+F12). Video titles are translated too
-* **SponsorBlock** skips sponsors and intros and marks every other segment on the seek bar. The
-  server never learns which video is playing
+* **SponsorBlock** skips sponsors, self promotion and intros and marks every other segment on the
+  seek bar. The server never learns which video is playing
 * **Per video volume** remembered for every video, and a fresh player starts at the last volume
 * **Queue mode** (F9) makes browser clicks stack up into a looping playlist instead of
   replacing the video

@@ -32,7 +32,7 @@ local LABELS = {
     filler      = "Filler",
 }
 
-local AUTO_SKIP = { sponsor = true, intro = true }
+local AUTO_SKIP = { sponsor = true, selfpromo = true, intro = true }
 
 local segments = {}        -- sorted by start: { start, stop, category, label }
 local skipping = true      -- reset to true on every new file
