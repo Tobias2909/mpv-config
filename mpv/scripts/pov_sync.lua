@@ -691,12 +691,41 @@ local function build_graph()
     return table.concat(p, ";")
 end
 
-local function display_size()
-    if o.canvas_w > 0 and o.canvas_h > 0 then return even(o.canvas_w), even(o.canvas_h) end
+-- mpv on Wayland reports a screen's size plus where the screen sits on the
+-- desktop, so a screen placed 39 pixels down comes out 39 rows too tall and
+-- the canvas gets squeezed into the window with bars at the sides. A window
+-- over the whole screen has the true size, which is kept for that screen.
+local true_size = {}
+local said
+
+-- the size the screen has now, nil while the window is being made anew (no
+-- screen name, no window size), as a guess then would build the graph twice
+local function screen_size()
+    local names = mp.get_property_native("display-names") or {}
     local w = mp.get_property_number("display-width")
     local h = mp.get_property_number("display-height")
-    if not w or not h or w < 320 or h < 180 then return 1920, 1080 end
-    return even(w), even(h)
+    if not names[1] or not w or not h or w < 320 or h < 180 then return nil end
+    local key = ("%s %dx%d"):format(table.concat(names, ","), w, h)
+    local d = mp.get_property_native("osd-dimensions") or {}
+    if mp.get_property_bool("fullscreen") then
+        if (d.w or 0) < 320 or (d.h or 0) < 180 then return nil end
+        -- rounded down, a fractional desktop scale can make the window a row
+        -- taller than the screen
+        true_size[key] = { math.min(w, math.floor(d.w / 2) * 2), math.min(h, math.floor(d.h / 2) * 2) }
+    end
+    local t = true_size[key] or { even(w), even(h) }
+    local line = ("canvas %dx%d for %s"):format(t[1], t[2], key)
+    if line ~= said then msg.debug(line) end
+    said = line
+    return t[1], t[2]
+end
+
+local function display_size()
+    if o.canvas_w > 0 and o.canvas_h > 0 then return even(o.canvas_w), even(o.canvas_h) end
+    local w, h = screen_size()
+    if w then return w, h end
+    if canvas then return canvas.w, canvas.h end
+    return 1920, 1080
 end
 
 ---------------------------------------------------------------- mouse
@@ -1555,18 +1584,22 @@ mp.observe_property("mute", "bool", function(_, m)
     if second and heard == away then second:set("mute", m) end
 end)
 
+-- the canvas follows the display, a window moved to another screen gets a
+-- new one, and so does one that first shows the screen's true size
+local function canvas_check()
+    if saved and canvas and not (o.canvas_w > 0 and o.canvas_h > 0) then
+        local w, h = screen_size()
+        if w and (w ~= canvas.w or h ~= canvas.h) then rebuild() end
+    end
+end
+
 -- a resized window moves the picture, and the clickable area with it
 mp.observe_property("osd-dimensions", "native", function()
+    canvas_check()
     area_sync()
 end)
-
--- the canvas follows the display, a window moved to another screen gets a new one
-mp.observe_property("display-width", "number", function()
-    if saved and canvas then
-        local w, h = display_size()
-        if w ~= canvas.w or h ~= canvas.h then rebuild() end
-    end
-end)
+mp.observe_property("display-width", "number", canvas_check)
+mp.observe_property("display-height", "number", canvas_check)
 
 -- mpv builds the graph anew on a seek, from the layout files, so what it was
 -- told since is gone
