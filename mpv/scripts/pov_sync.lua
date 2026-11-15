@@ -54,17 +54,27 @@
 -- quitting while another view is heard would bring that track number back the
 -- next time the file is opened alone, which is no sound at all.
 --
--- Seeks are exact while an added view is heard. A seek by the arrow keys or
--- the wheel normally starts at a keyframe near its target, and mpv starts the
--- sound there too, but only sound from the same file as the picture. An
--- added view's sound is a file of its own and started at the target, so
--- after a seek back that view stayed silent until the picture got there, up
--- to 4.6 s on a real pair of streams (measured). An exact seek starts picture
--- and sound at the target, 0.3 to 1.3 s after the key when the target is in
--- the cache. A keyframe seek back showed the picture after 0.1 to 0.3 s but
--- the sound only after 0.4 to 4.7 s. The first view's sound comes from the
--- file of its picture, so with it heard seeks stay as they are: 0.05 to 0.25
--- s, against 0.2 to 1 s exact.
+-- The first view's sound plays from a copy, a file of its own like an
+-- added view's. Selecting a track again in the file that holds the first
+-- view's picture makes mpv read that file anew from the playing position,
+-- and it drops everything cached for it to do so (initiate_refresh_seek in
+-- demux.c): coming back to the first view's sound emptied the 58 s cached
+-- behind the playing position on a real stream (measured), and 2.1 GB after
+-- a long stretch. With the copy no track of that file is selected again
+-- while views play, so its cache stays. Its own track comes back when the
+-- views end.
+--
+-- Seeks are exact while sound from a file of its own is heard, which with
+-- the copy is every view in this player. A seek by the arrow keys or the
+-- wheel normally starts at a keyframe near its target, and mpv starts the
+-- sound there too, but only sound from the same file as the picture. Sound
+-- from a file of its own started at the target, so after a seek back that
+-- view stayed silent until the picture got there, up to 4.6 s on a real
+-- pair of streams (measured). An exact seek starts picture and sound at the
+-- target, 0.3 to 1.3 s after the key when the target is in the cache. A
+-- keyframe seek back showed the picture after 0.1 to 0.3 s but the sound
+-- only after 0.4 to 4.7 s. The first view with its own sound sought in 0.05
+-- to 0.25 s, against 0.2 to 1 s exact, which is what the copy costs.
 --
 -- The filters run on the CPU, so decoding switches to copy back while views
 -- play, and the demuxer cache is cut to cache_mib each way, since every view
@@ -943,10 +953,12 @@ local function hear(k)
         second:set("mute", mp.get_property_bool("mute"))
     else
         if second then second:set("mute", true) end
-        mp.set_property_number("aid", v.aid)
+        mp.set_property_number("aid", v.copy_aid or v.aid)
     end
     -- exact seeks for sound from a file of its own, see SOUND
-    if saved then mp.set_property("hr-seek", (k ~= 1 and k ~= away) and "yes" or saved.hr) end
+    if saved then
+        mp.set_property("hr-seek", (k ~= away and (k ~= 1 or v.copy_aid)) and "yes" or saved.hr)
+    end
     settle(1.5)
     if second then
         second:show(("%d  %s%s"):format(away, views[away].name, away == heard and "  ♪" or ""), o.label_secs)
@@ -1383,6 +1395,8 @@ local function add_tracks(result)
     local function finished()
         waiting = waiting - 1
         if waiting > 0 then return end
+        local one = views[1]
+        if one.copy and not one.copy_aid then one.copy_aid = track_id("audio", one.copy) end
         for _, v in ipairs(added) do
             v.vid = track_id("video", v.vedl)
             v.aid = track_id("audio", v.aedl)
@@ -1399,6 +1413,7 @@ local function add_tracks(result)
         if #views > 1 then
             enter()
             rebuild()
+            if heard == 1 and one.copy_aid and mp.get_property_number("aid") ~= one.copy_aid then hear(1) end
         end
     end
     local first = result.videos[1]
@@ -1440,19 +1455,25 @@ local function add_tracks(result)
         end
     end
     if #added == 0 then return end
+    local cmds = {}
+    -- the first view's sound from a file of its own as well, see SOUND
+    local one = views[1]
+    if one.aedl and not one.copy then
+        one.copy = one.aedl
+        cmds[#cmds + 1] = { "audio-add", one.copy, "auto", one.name }
+    end
     for _, v in ipairs(added) do
-        for _, c in ipairs({ { "video-add", v.vedl, "auto", v.name },
-                             v.aedl and { "audio-add", v.aedl, "auto", v.name } or false }) do
-            if c then
-                waiting = waiting + 1
-                local id
-                id = mp.command_native_async(c, function()
-                    pending[id] = nil
-                    finished()
-                end)
-                pending[id] = true
-            end
-        end
+        cmds[#cmds + 1] = { "video-add", v.vedl, "auto", v.name }
+        if v.aedl then cmds[#cmds + 1] = { "audio-add", v.aedl, "auto", v.name } end
+    end
+    for _, c in ipairs(cmds) do
+        waiting = waiting + 1
+        local id
+        id = mp.command_native_async(c, function()
+            pending[id] = nil
+            finished()
+        end)
+        pending[id] = true
     end
 end
 
