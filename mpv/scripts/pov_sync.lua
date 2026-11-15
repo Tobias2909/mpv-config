@@ -70,6 +70,28 @@
 -- play, and the demuxer cache is cut to cache_mib each way, since every view
 -- keeps one. Both come back when the file ends, and so does hr-seek.
 --
+-- KEEPING UP. mpv plays the sound at full speed and lets a late picture catch
+-- up by skipping frames at the screen. Here that saves nothing, the work is
+-- done before the screen: every view is copied back from the GPU, laid on
+-- the canvas and sent up again, which leans on memory bandwidth. With another
+-- heavy program running the picture falls behind the sound and stays behind.
+-- Measured with four 1080p60 views and two programs streaming big arrays
+-- through memory: the picture managed 0.71x of real time and was 17.5 s
+-- behind the sound after a minute. Changing the sound track only helps for a
+-- moment, as it starts the sound where the picture is.
+-- So while views play, the A-V figure mpv itself measures is watched. When
+-- the picture falls behind, playback slows to 85% of the pace the picture
+-- keeps until the two are together again, then to 97% of it. Calm stretches
+-- try a step faster (4% at first, each one that held twice the last up to
+-- 10% and sooner), and normal speed comes back when the computer has room
+-- again. A step that fails, or falling behind soon after normal speed came
+-- back, makes the next try smaller and wait twice as long. The same load
+-- at 0.75x: 1.7 s behind after a minute, as 0.72x was all it allowed. A
+-- picture that stands still (a seek, the network) is mpv's to sort out. A
+-- speed set by hand counts as the speed to come back to. While it is lower,
+-- `speed` is out of watch-later-options, which mpv writes before a script
+-- hears of a quit, so no slow speed is kept for the next time.
+--
 -- Keys while views play: 1 to 9 make that view big and play its sound, the
 -- same key again or 0 shows all views the same size, p puts the heard view
 -- over the whole screen and the others in boxes (p again or 0 ends it, 1 to 9
@@ -132,6 +154,10 @@ local o = {
     screen = "DP-1",
     -- more mpv options for the player on that screen, split at spaces
     screen_args = "",
+    -- slow down when the computer cannot keep up, see KEEPING UP
+    keep_up = true,
+    -- the slowest share of the normal speed it goes down to
+    slowest = 0.6,
 }
 options.read_options(o, "pov_sync")
 
@@ -754,6 +780,128 @@ local function relayout()
     flash_labels()
 end
 
+---------------------------------------------------------------- keeping up
+
+local TICK = 0.25
+local up = {
+    timer = nil,
+    base = nil,     -- the speed to come back to, set only while slower than it
+    set = nil,      -- the speed set here last, to tell it from a change by hand
+    state = nil,    -- "catching" while the gap closes, "cruising" after it
+    pace = nil,     -- the picture's pace when it last fell behind
+    hist = {},      -- { mp time, time-pos } of the last two seconds
+    calm = 0,       -- since when picture and sound are together
+    wait = 6,       -- seconds together before a step faster
+    step = 0.04,    -- how much faster the next step is, doubled after one that held
+    probed = nil,   -- a step faster was made and not yet undone
+    back = nil,     -- when the steps last reached the chosen speed again
+    settle = 0,     -- nothing is judged before this time
+    listed = false, -- speed was taken out of watch-later-options here
+}
+
+-- speed in watch-later-options again, or out of it while slower than chosen
+local function speed_kept(on)
+    if on then
+        if up.listed then mp.commandv("change-list", "watch-later-options", "append", "speed") end
+        up.listed = false
+        return
+    end
+    if up.listed then return end
+    for _, name in ipairs(mp.get_property_native("watch-later-options") or {}) do
+        if name == "speed" then
+            mp.commandv("change-list", "watch-later-options", "remove", "speed")
+            up.listed = true
+            return
+        end
+    end
+end
+
+-- after a seek, a new sound or a change of speed the figures need a moment
+local function settle(secs)
+    up.settle = math.max(up.settle, mp.get_time() + secs)
+    up.hist = {}
+end
+
+local function set_speed(s)
+    up.set = s
+    mp.set_property_number("speed", s)
+    settle(0.5)
+end
+
+-- normal again: back to the chosen speed, or only forget it when it was
+-- changed by hand
+local function at_base(set_it)
+    if up.base and set_it then set_speed(up.base) end
+    up.base, up.state, up.pace, up.wait, up.step, up.probed, up.back = nil, nil, nil, 6, 0.04, nil, nil
+    speed_kept(true)
+end
+
+local function keep_up()
+    local now = mp.get_time()
+    if heard == away and up.base then at_base(true) end
+    -- two calm minutes at the chosen speed and the load is gone
+    if up.back and now - up.back > 120 then up.back, up.wait = nil, 6 end
+    local av = mp.get_property_number("avsync")
+    local pos = mp.get_property_number("time-pos")
+    if not saved or heard == away or mp.get_property_bool("core-idle", true)
+       or not av or not pos or now < up.settle then
+        up.hist, up.calm = {}, now
+        return
+    end
+    local h = up.hist
+    h[#h + 1] = { now, pos }
+    while now - h[1][1] > 2 do table.remove(h, 1) end
+    -- avsync is sound minus picture: above 0 the picture is late
+    if av > 0.05 then up.calm = now end
+    local span = now - h[1][1]
+    if span < 1 then return end
+    local speed = mp.get_property_number("speed", 1)
+    local base = up.base or speed
+    local pace = (pos - h[1][2]) / span
+    -- a picture standing still is a seek or the network, not the computer
+    if pace < 0.3 * speed then return end
+    local behind = (av > 0.1 and pace < speed * 0.98) or (av > 0.2 and pace <= speed * 1.005)
+    if behind then
+        -- the last step faster was one too many, the next is small and waits longer
+        if up.probed or up.back then up.wait, up.step = math.min(60, up.wait * 2), 0.04 end
+        up.probed, up.back = nil, nil
+        local s = math.max(base * o.slowest, math.min(pace * 0.85, speed * 0.99))
+        if not up.base then
+            up.base = speed
+            speed_kept(false)
+            mp.osd_message(("POV: the computer cannot keep up, %.2fx keeps sound and picture together")
+                :format(s), 5)
+        end
+        msg.info(("keeping up: picture %.3fx, %.0f ms behind the sound, speed %.3f"):format(pace, av * 1000, s))
+        up.state, up.pace = "catching", pace
+        set_speed(s)
+    elseif up.state == "catching" and av < 0.04 then
+        up.state = "cruising"
+        set_speed(math.max(base * o.slowest, math.min(base, up.pace * 0.97)))
+    elseif up.state == "cruising" and now - up.calm >= up.wait then
+        up.calm = now
+        -- the step before held, so this one may be bigger and come sooner
+        if up.probed then up.step, up.wait = math.min(0.1, up.step * 2), math.max(6, up.wait / 2) end
+        local s = math.min(base, speed * (1 + up.step))
+        if s >= base - 1e-6 then
+            local wait = up.wait
+            at_base(true)
+            -- falling behind again soon counts like a step that did not hold
+            up.wait, up.back = wait, now
+            msg.info("keeping up: normal speed again")
+            mp.osd_message("POV: normal speed again", 3)
+        else
+            up.probed = true
+            set_speed(s)
+        end
+    end
+end
+
+-- a speed set by hand while slower is the one to come back to from now on
+mp.observe_property("speed", "number", function(_, v)
+    if up.base and v and math.abs(v - (up.set or v)) > 1e-6 then at_base(false) end
+end)
+
 ---------------------------------------------------------------- keys
 
 local function hear(k)
@@ -770,6 +918,7 @@ local function hear(k)
     end
     -- exact seeks for sound from a file of its own, see SOUND
     if saved then mp.set_property("hr-seek", (k ~= 1 and k ~= away) and "yes" or saved.hr) end
+    settle(1.5)
     if second then
         second:show(("%d  %s%s"):format(away, views[away].name, away == heard and "  ♪" or ""), o.label_secs)
     end
@@ -1074,6 +1223,10 @@ local function enter()
     mp.set_property("demuxer-max-back-bytes", o.cache_mib .. "MiB")
     mp.commandv("change-list", "watch-later-options", "remove", "aid")
     bind_keys()
+    if o.keep_up then
+        settle(2)
+        up.timer = mp.add_periodic_timer(TICK, keep_up)
+    end
 end
 
 local function stop_job()
@@ -1091,6 +1244,9 @@ local function leave()
     add_timer = nil
     for id in pairs(pending) do mp.abort_async_command(id) end
     pending = {}
+    if up.timer then up.timer:kill() end
+    up.timer = nil
+    at_base(true)
     if saved then
         -- the leader's own sound first, so whatever gets saved for it is right
         if views[1] and views[1].aid then mp.set_property_number("aid", views[1].aid) end
@@ -1414,7 +1570,14 @@ end)
 
 -- mpv builds the graph anew on a seek, from the layout files, so what it was
 -- told since is gone
-mp.register_event("seek", function() sent = {} end)
+mp.register_event("seek", function()
+    sent = {}
+    settle(2)
+end)
+mp.register_event("playback-restart", function() settle(1.5) end)
+mp.observe_property("core-idle", "bool", function(_, idle)
+    if not idle then settle(1) end
+end)
 
 mp.register_event("shutdown", leave)
 
