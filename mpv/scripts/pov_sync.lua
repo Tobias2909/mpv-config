@@ -76,6 +76,14 @@
 -- only after 0.4 to 4.7 s. The first view with its own sound sought in 0.05
 -- to 0.25 s, against 0.2 to 1 s exact, which is what the copy costs.
 --
+-- THE PLACE IN EVERY VIEW. When mpv saves the place in the first view (a
+-- quit with save-position-on-quit, Shift+Q, or another video replacing it),
+-- the place in every other view is saved too, in a watch_later file of its
+-- own, so that view played alone later starts at the same moment of the
+-- session. The file is named the way mpv names it, the MD5 of the address,
+-- made by the av_md5_sum mpv itself uses. A view that has not started yet
+-- at that moment, or has ended, gets none.
+--
 -- The filters run on the CPU, so decoding switches to copy back while views
 -- play, and the demuxer cache is cut to cache_mib each way, since every view
 -- keeps one. Both come back when the file ends, and so does hr-seek.
@@ -1347,9 +1355,12 @@ end
 
 -- a track that starts `offset` seconds into its stream, or after -offset
 -- seconds of black and silence when it started later than the leader
+local function shift_parts(offset)
+    return { { from = math.max(0, -offset), at = math.max(0, offset) } }
+end
+
 local function shifted(url, offset, blank, blank_secs)
-    return pieced(url, { { from = math.max(0, -offset), at = math.max(0, offset) } },
-                  blank, blank_secs)
+    return pieced(url, shift_parts(offset), blank, blank_secs)
 end
 
 local function clock(secs)
@@ -1439,14 +1450,16 @@ local function add_tracks(result)
                 mp.osd_message(("POV: %s shares no sound with the others, left out%s")
                     :format(short_name(r), hint), 8)
             elseif r.video and #views + #added < MAX_VIEWS then
-                local v = { url = r.url, name = short_name(r), offset = r.offset }
+                local v = { url = r.url, name = short_name(r), offset = r.offset, duration = r.duration }
                 if r.pieces and #r.pieces > 1 then
+                    v.parts = r.pieces
                     v.vedl = pieced(r.video, r.pieces, result.blank, result.blank_secs)
                     v.aedl = r.audio and pieced(r.audio, r.pieces, result.blank, result.blank_secs)
                     local text = ("POV: %s was edited, kept in step: %s"):format(v.name, changes(r.pieces))
                     msg.info(text)
                     mp.osd_message(text, 8)
                 else
+                    v.parts = shift_parts(r.offset)
                     v.vedl = shifted(r.video, r.offset, result.blank, result.blank_secs)
                     v.aedl = r.audio and shifted(r.audio, r.offset, result.blank, result.blank_secs)
                 end
@@ -1593,8 +1606,71 @@ mp.register_event("file-loaded", function()
     if leader and mp.get_property("path") ~= leader then leave() end
 end)
 
+---------------------------------------------------------------- the place in every view
+
+local md5_ok = pcall(ffi.cdef, "void av_md5_sum(uint8_t *dst, const char *src, size_t len);")
+    and pcall(function() return ffi.C.av_md5_sum end)
+
+-- the name mpv gives a watch_later file, see THE PLACE IN EVERY VIEW
+local function md5_hex(text)
+    local sum = ffi.new("uint8_t[16]")
+    ffi.C.av_md5_sum(sum, text, #text)
+    local hex = {}
+    for i = 0, 15 do hex[i + 1] = ("%02X"):format(sum[i]) end
+    return table.concat(hex)
+end
+
+-- mpv's own test (mp_is_url), anything else is a local file it names differently
+local function is_url(text)
+    local proto = text:match("^(.-)://")
+    return proto ~= nil and proto:match("^%a[%w.+-]*$") ~= nil
+end
+
+-- where a view is at `t` on the leader's clock: in a gap of a cut recording
+-- where it goes on, nil before it starts or near its end
+local function view_time(v, t)
+    for n, p in ipairs(v.parts or {}) do
+        if t < p.from then return n > 1 and p.at or nil end
+        if not p.to or t < p.to then
+            local at = p.at + (t - p.from)
+            if v.duration and at > v.duration - 1 then return nil end
+            return at
+        end
+    end
+end
+
+local function save_places()
+    local path = mp.get_property("path")
+    if not md5_ok or not path or not is_url(path) or #views < 2 then return end
+    local dir = mp.get_property("watch-later-dir", "")
+    dir = mp.command_native({ "expand-path", dir ~= "" and dir or "~~state/watch_later" })
+    local own = utils.join_path(dir, md5_hex(path))
+    -- mpv saves the leader before this hook runs, so a fresh file is the sign
+    local info = utils.file_info(own)
+    if not info or info.mtime < os.time() - 5 then return end
+    local t = tonumber(("\n" .. (read_file(own) or "")):match("\nstart=([%d.]+)"))
+    if not t then return end
+    local named = mp.get_property_bool("write-filename-in-watch-later-config")
+    local n = 0
+    for k = 2, #views do
+        local v = views[k]
+        local at = is_url(v.url) and view_time(v, t)
+        local f = at and io.open(utils.join_path(dir, md5_hex(v.url)), "wb")
+        if f then
+            if named then f:write("# ", (v.url:gsub("%c", "_")), "\n") end
+            f:write(("start=%f\n"):format(at))
+            f:close()
+            n = n + 1
+        end
+    end
+    msg.info(("place %.3f saved for %d more views"):format(t, n))
+end
+
 mp.add_hook("on_unload", 50, function()
-    if leader then leave() end
+    if leader then
+        save_places()
+        leave()
+    end
 end)
 
 -- while the other screen's view is heard, its sound follows this one's
