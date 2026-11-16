@@ -106,6 +106,9 @@
 -- back, makes the next try smaller and wait twice as long. The same load
 -- at 0.75x: 1.7 s behind after a minute, as 0.72x was all it allowed. A
 -- picture that stands still (a seek, the network) is mpv's to sort out. A
+-- message says so when playback first slows, and a line in the top right
+-- corner stays for as long as it is slower, as the message alone was easy to
+-- miss during minutes of slower sound. A
 -- speed set by hand counts as the speed to come back to. While it is lower,
 -- `speed` is out of watch-later-options, which mpv writes before a script
 -- hears of a quit, so no slow speed is kept for the next time.
@@ -846,6 +849,23 @@ local up = {
     listed = false, -- speed was taken out of watch-later-options here
 }
 
+-- while slower than chosen, a line top right says so, in the view labels' look
+local badge = mp.create_osd_overlay("ass-events")
+
+local function badge_sync()
+    local p = picture()
+    if not up.base or not p then
+        badge:remove()
+        return
+    end
+    local fs = math.max(16, math.floor(p.oh / 40))
+    badge.res_x, badge.res_y = p.ow, p.oh
+    badge.data = ("{\\an9\\pos(%d,%d)\\fs%d\\bord3\\shad0\\1c&HFFFFFF&\\3c&H000000&}slower, %.2fx: the computer is busy")
+        :format(p.x + p.w - math.floor(fs / 2), p.y + math.floor(fs / 3), fs,
+                up.set or mp.get_property_number("speed", 1))
+    badge:update()
+end
+
 -- speed in watch-later-options again, or out of it while slower than chosen
 local function speed_kept(on)
     if on then
@@ -873,6 +893,7 @@ local function set_speed(s)
     up.set = s
     mp.set_property_number("speed", s)
     settle(0.5)
+    badge_sync()
 end
 
 -- normal again: back to the chosen speed, or only forget it when it was
@@ -881,6 +902,7 @@ local function at_base(set_it)
     if up.base and set_it then set_speed(up.base) end
     up.base, up.state, up.pace, up.wait, up.step, up.probed, up.back = nil, nil, nil, 6, 0.04, nil, nil
     speed_kept(true)
+    badge_sync()
 end
 
 local function keep_up()
@@ -1694,6 +1716,7 @@ end
 mp.observe_property("osd-dimensions", "native", function()
     canvas_check()
     area_sync()
+    badge_sync()
 end)
 mp.observe_property("display-width", "number", canvas_check)
 mp.observe_property("display-height", "number", canvas_check)

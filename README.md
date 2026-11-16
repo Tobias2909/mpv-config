@@ -42,8 +42,9 @@ tuning.
   the whole screen with the others in boxes that move and size like the chat box, and Ctrl+1
   to 9 move one to a second screen in a player of its own that stays in step. When the computer
   is too busy for all views, playback slows down a little so sound and picture stay together,
-  and comes back to normal speed once there is room again. Closing the player remembers the
-  spot in every view, so each one opened alone later goes on from the same moment
+  says so in the top right corner, and comes back to normal speed once there is room again.
+  Closing the player remembers the spot in every view, so each one opened alone later goes on
+  from the same moment
 * **Key cheat sheet** on h, read from `input.conf`, showing which shader is really active
 * **YouTube Premium** enhanced bitrate, with cookies read live from the browser profile so the
   login never expires, and watched videos land in the YouTube history
