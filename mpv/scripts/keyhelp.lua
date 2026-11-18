@@ -54,7 +54,10 @@ local DESC = {
 
 -- Duplicates of a key already described above; parsed but not shown twice.
 -- KP_INS is the same binding as KP0 and its row already says so.
-local SKIP = { KP_ADD = true, KP_SUBTRACT = true, KP_INS = true }
+-- The two right clicks only restore what mpv did before 0.42, and two more
+-- rows would shrink the whole sheet's font, so they stay off it.
+local SKIP = { KP_ADD = true, KP_SUBTRACT = true, KP_INS = true,
+               MBTN_RIGHT = true, ["Ctrl+MBTN_RIGHT"] = true }
 
 -- Which shader file is loaded right now. The shader keys are no longer a
 -- "press F1 for the default" bank: mpv.conf's [light-shader] profile picks F1's
